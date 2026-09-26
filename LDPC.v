@@ -1,11 +1,17 @@
+// LDPC.v -- Lab02 v1 architecture.
+// 16 CNU lanes (one full layer per cycle), rotated storage in bank A/B,
+// touch-based (first/mid/last) bank control shared by both modes,
+// 4-stage c2v FIFO, rotate-by-1 input load / output.
+// See arch_notes.md section 3 for the derivation of every constant below.
+
 module CNU_lane (
-    input  [5:0] q_sm0,
-    input  [5:0] q_sm1,
-    input  [5:0] q_sm2,
-    input  [5:0] q_sm3,
-    input  [5:0] q_sm4,
-    input  [5:0] q_sm5,
-    input  [5:0] q_sm6,
+    input  signed [5:0] q0,
+    input  signed [5:0] q1,
+    input  signed [5:0] q2,
+    input  signed [5:0] q3,
+    input  signed [5:0] q4,
+    input  signed [5:0] q5,
+    input  signed [5:0] q6,
 
     output reg [19:0] c2v_new,
     output reg [41:0] r_new_flat
@@ -31,6 +37,16 @@ module CNU_lane (
     reg       sign_parity;
     reg [4:0] norm_min1;
     reg [4:0] norm_min2;
+
+    function [4:0] abs6;
+        input signed [5:0] value;
+        begin
+            if (value[5])
+                abs6 = (~value[4:0]) + 5'd1;
+            else
+                abs6 = value[4:0];
+        end
+    endfunction
 
     function [12:0] merge_top2;
         input [12:0] left_value;
@@ -79,13 +95,13 @@ module CNU_lane (
     endfunction
 
     always @(*) begin
-        mag0 = q_sm0[4:0];
-        mag1 = q_sm1[4:0];
-        mag2 = q_sm2[4:0];
-        mag3 = q_sm3[4:0];
-        mag4 = q_sm4[4:0];
-        mag5 = q_sm5[4:0];
-        mag6 = q_sm6[4:0];
+        mag0 = abs6(q0);
+        mag1 = abs6(q1);
+        mag2 = abs6(q2);
+        mag3 = abs6(q3);
+        mag4 = abs6(q4);
+        mag5 = abs6(q5);
+        mag6 = abs6(q6);
 
         leaf[0] = {mag0, 3'd0, 5'd31};
         leaf[1] = {mag1, 3'd1, 5'd31};
@@ -105,8 +121,7 @@ module CNU_lane (
         norm_min1 = norm5(root_pair[12:8]);
         norm_min2 = norm5(root_pair[4:0]);
 
-        q_neg = {q_sm6[5], q_sm5[5], q_sm4[5], q_sm3[5],
-                 q_sm2[5], q_sm1[5], q_sm0[5]};
+        q_neg = {q6[5], q5[5], q4[5], q3[5], q2[5], q1[5], q0[5]};
         sign_parity = ^q_neg;
         r_neg = q_neg ^ {7{sign_parity}};
 
@@ -150,65 +165,452 @@ module LDPC (
     output reg         out_warn
 );
 
-    localparam [1:0] S_IDLE   = 2'd0;
-    localparam [1:0] S_READ   = 2'd1;
-    localparam [1:0] S_LDPC   = 2'd2;
-    localparam [1:0] S_OUTPUT = 2'd3;
-
-    localparam integer CNU_COUNT  = 8;
-    localparam integer EDGE_COUNT = 7;
+    localparam [1:0] S_IDLE = 2'd0;
+    localparam [1:0] S_LOAD = 2'd1;
+    localparam [1:0] S_RUN  = 2'd2;
+    localparam [1:0] S_OUT  = 2'd3;
 
     reg [1:0] state;
-    reg [1:0] next_state_c;
+    reg [1:0] next_state;
     reg       mode_reg;
 
-    reg [6:0] read_idx;
-    reg [6:0] output_idx;
-    reg [3:0] iteration_cnt;
-    reg [2:0] cnu8_cnt;
+    reg [6:0] io_cnt;
+    reg [1:0] layer;
+    reg [3:0] iter;
 
-    wire [1:0] layer;
-    wire       batch;
-    assign layer = cnu8_cnt[2:1];
-    assign batch = cnu8_cnt[0];
+    reg signed [7:0] A [0:7][0:15];
+    reg signed [7:0] B [0:7][0:15];
+    reg        [19:0] c2v_fifo [0:3][0:15];
 
-    reg signed [7:0] Lja [0:7][0:15];
-    reg signed [7:0] Ljb [0:7][0:15];
-    reg       [19:0] c2v_queue [0:7][0:7];
+    integer rr;
 
-    reg        [15:0] pair_vector [0:6][0:7];
+    //============================================================
+    // Shared control
+    //============================================================
 
+    wire check_cycle = (state == S_RUN) && (layer == 2'd0) && (iter != 4'd0);
+    wire at_limit     = (iter == 4'd8);
     wire syndrome_nonzero;
-    wire check_cycle;
-    wire at_limit;
-    wire continue_iter;
-    wire stop_now;
-    wire ldpc_commit;
-    wire zero_old;
-    wire current_bank_sel;
-    wire late_input_write;
+    wire stop_now = check_cycle && (!syndrome_nonzero || at_limit);
+    wire commit   = (state == S_RUN) && !stop_now;
 
-    reg final_bank_sel;
-    reg warn_reg;
+    always @(*) begin
+        next_state = state;
+        case (state)
+            S_IDLE: if (in_mode_valid && !out_valid) next_state = S_LOAD;
+            S_LOAD: if (in_data_valid && io_cnt == 7'd127) next_state = S_RUN;
+            S_RUN:  if (stop_now) next_state = S_OUT;
+            S_OUT:  if (io_cnt == 7'd127) next_state = S_IDLE;
+            default: next_state = S_IDLE;
+        endcase
+    end
 
-    assign check_cycle = (state == S_LDPC) &&
-                         (cnu8_cnt == 3'd0) &&
-                         (iteration_cnt != 4'd0);
-    assign at_limit = (iteration_cnt == 4'd8);
-    assign continue_iter = check_cycle && syndrome_nonzero && !at_limit;
-    assign stop_now = check_cycle && (!syndrome_nonzero || at_limit);
-    assign ldpc_commit = (state == S_LDPC) &&
-                         (!check_cycle || continue_iter);
-    assign zero_old = (state == S_LDPC) && (iteration_cnt == 4'd0);
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) state <= S_IDLE;
+        else        state <= next_state;
+    end
 
-    // Mode 0 uses iteration-level ping-pong. Mode 1 always uses Lja.
-    assign current_bank_sel = mode_reg ? 1'b0 : iteration_cnt[0];
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            mode_reg <= 1'b0;
+        else if (in_mode_valid && (state == S_IDLE) && !out_valid)
+            mode_reg <= in_mode;
+    end
 
-    // Input[127] is accepted while iteration 1, layer 0, batch 0 is computed.
-    assign late_input_write = (state == S_LDPC) &&
-                              (iteration_cnt == 4'd0) &&
-                              (cnu8_cnt == 3'd0) &&
-                              in_data_valid && (read_idx == 7'd127);
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            io_cnt <= 7'd0;
+        end else if (in_mode_valid && (state == S_IDLE) && !out_valid) begin
+            io_cnt <= 7'd0;
+        end else if ((state == S_LOAD) && in_data_valid) begin
+            io_cnt <= io_cnt + 7'd1;
+        end else if (stop_now) begin
+            io_cnt <= 7'd1;
+        end else if (state == S_OUT) begin
+            io_cnt <= (io_cnt == 7'd127) ? 7'd0 : io_cnt + 7'd1;
+        end
+    end
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            layer <= 2'd0;
+            iter  <= 4'd0;
+        end else if (in_mode_valid && (state == S_IDLE) && !out_valid) begin
+            layer <= 2'd0;
+            iter  <= 4'd0;
+        end else if ((state == S_RUN) && !stop_now) begin
+            layer <= (layer == 2'd3) ? 2'd0 : layer + 2'd1;
+            if (layer == 2'd3) iter <= iter + 4'd1;
+        end
+    end
+
+    //============================================================
+    // Per-layer edge table: edge e (0..6) is normally column e+1;
+    // column 0 borrows edge (layer-1) at layer 1/2/3.
+    //============================================================
+
+    reg [2:0] col_sel    [0:6];
+    reg       touch_first [0:6];
+    integer   ti;
+
+    always @(*) begin
+        case (layer)
+            2'd0: begin
+                col_sel[0] = 3'd1; col_sel[1] = 3'd2; col_sel[2] = 3'd3;
+                col_sel[3] = 3'd4; col_sel[4] = 3'd5; col_sel[5] = 3'd6;
+                col_sel[6] = 3'd7;
+                for (ti = 0; ti < 7; ti = ti + 1) touch_first[ti] = 1'b1;
+            end
+            2'd1: begin
+                col_sel[0] = 3'd0; col_sel[1] = 3'd2; col_sel[2] = 3'd3;
+                col_sel[3] = 3'd4; col_sel[4] = 3'd5; col_sel[5] = 3'd6;
+                col_sel[6] = 3'd7;
+                touch_first[0] = 1'b1;
+                for (ti = 1; ti < 7; ti = ti + 1) touch_first[ti] = 1'b0;
+            end
+            2'd2: begin
+                col_sel[0] = 3'd1; col_sel[1] = 3'd0; col_sel[2] = 3'd3;
+                col_sel[3] = 3'd4; col_sel[4] = 3'd5; col_sel[5] = 3'd6;
+                col_sel[6] = 3'd7;
+                for (ti = 0; ti < 7; ti = ti + 1) touch_first[ti] = 1'b0;
+            end
+            default: begin // layer 3
+                col_sel[0] = 3'd1; col_sel[1] = 3'd2; col_sel[2] = 3'd0;
+                col_sel[3] = 3'd4; col_sel[4] = 3'd5; col_sel[5] = 3'd6;
+                col_sel[6] = 3'd7;
+                for (ti = 0; ti < 7; ti = ti + 1) touch_first[ti] = 1'b0;
+            end
+        endcase
+    end
+
+    //============================================================
+    // Edge datapath (7 edges x 16 lanes)
+    //============================================================
+
+    wire signed [7:0] Xv     [0:6][0:15];
+    wire signed [7:0] Qv     [0:6][0:15];
+    wire        [4:0] ro_mag [0:6][0:15];
+    wire               ro_neg [0:6][0:15];
+    wire signed [7:0] ro     [0:6][0:15];
+    wire signed [7:0] q_base [0:6][0:15];
+    wire signed [7:0] x_base [0:6][0:15];
+    wire signed [5:0] q_msg  [0:6][0:15];
+
+    function [5:0] clip6;
+        input signed [7:0] value;
+        begin
+            if (value > 8'sd31)
+                clip6 = 6'sd31;
+            else if (value < -8'sd31)
+                clip6 = -6'sd31;
+            else
+                clip6 = value[5:0];
+        end
+    endfunction
+
+    genvar ge, gl;
+    generate
+        for (ge = 0; ge < 7; ge = ge + 1) begin: EDGE
+            for (gl = 0; gl < 16; gl = gl + 1) begin: LANE
+                assign Xv[ge][gl] = touch_first[ge] ? A[col_sel[ge]][gl]
+                                                     : B[col_sel[ge]][gl];
+                assign Qv[ge][gl] = (!mode_reg || touch_first[ge]) ? A[col_sel[ge]][gl]
+                                                                    : B[col_sel[ge]][gl];
+                assign ro_mag[ge][gl] = (c2v_fifo[0][gl][9:7] == ge[2:0])
+                                        ? c2v_fifo[0][gl][14:10]
+                                        : c2v_fifo[0][gl][19:15];
+                assign ro_neg[ge][gl] = c2v_fifo[0][gl][ge];
+                assign ro[ge][gl] = ro_neg[ge][gl] ? -$signed({3'b0, ro_mag[ge][gl]})
+                                                    :  $signed({3'b0, ro_mag[ge][gl]});
+                assign q_base[ge][gl] = Qv[ge][gl] - ro[ge][gl];
+                assign x_base[ge][gl] = Xv[ge][gl] - ro[ge][gl];
+                assign q_msg[ge][gl]  = clip6(q_base[ge][gl]);
+            end
+        end
+    endgenerate
+
+    wire [19:0] c2v_new_lane    [0:15];
+    wire [41:0] r_new_flat_lane [0:15];
+
+    genvar glane;
+    generate
+        for (glane = 0; glane < 16; glane = glane + 1) begin: CNU_INST
+            CNU_lane u_cnu (
+                .q0(q_msg[0][glane]), .q1(q_msg[1][glane]),
+                .q2(q_msg[2][glane]), .q3(q_msg[3][glane]),
+                .q4(q_msg[4][glane]), .q5(q_msg[5][glane]),
+                .q6(q_msg[6][glane]),
+                .c2v_new(c2v_new_lane[glane]),
+                .r_new_flat(r_new_flat_lane[glane])
+            );
+        end
+    endgenerate
+
+    wire signed [7:0] newv [0:6][0:15];
+
+    genvar ne, nl;
+    generate
+        for (ne = 0; ne < 7; ne = ne + 1) begin: NEWV_EDGE
+            for (nl = 0; nl < 16; nl = nl + 1) begin: NEWV_LANE
+                wire signed [5:0] r_new_e = r_new_flat_lane[nl][ne*6 +: 6];
+                assign newv[ne][nl] = x_base[ne][nl] + {{2{r_new_e[5]}}, r_new_e};
+            end
+        end
+    endgenerate
+
+    //============================================================
+    // c2v FIFO: 4 stages, unconditional shift every cycle.
+    //============================================================
+
+    always @(posedge clk) begin
+        for (rr = 0; rr < 16; rr = rr + 1) begin
+            c2v_fifo[0][rr] <= c2v_fifo[1][rr];
+            c2v_fifo[1][rr] <= c2v_fifo[2][rr];
+            c2v_fifo[2][rr] <= c2v_fifo[3][rr];
+            c2v_fifo[3][rr] <= (state == S_RUN) ? c2v_new_lane[rr] : 20'd0;
+        end
+    end
+
+    //============================================================
+    // Bank A / B storage per column.
+    // Load/output use rotate-by-1 with one fixed injection/read point.
+    // RUN uses touch-based self-rotate (A) / new-write (A on last touch,
+    // B on first/mid touch), driven by the per-layer edge table above.
+    //============================================================
+
+    wire signed [7:0] inj_val = {{2{in_data[5]}}, in_data};
+
+    // ---- column 0 : inject 10, read 11, edge = layer-1
+    always @(posedge clk) begin
+        if ((state == S_LOAD) && in_data_valid && (io_cnt[6:4] == 3'd0)) begin
+            for (rr = 0; rr < 16; rr = rr + 1)
+                A[0][rr] <= (rr == 10) ? inj_val : A[0][(rr + 1) % 16];
+        end else if (((state == S_OUT) && (io_cnt[6:4] == 3'd0)) || stop_now) begin
+            for (rr = 0; rr < 16; rr = rr + 1)
+                A[0][rr] <= A[0][(rr + 1) % 16];
+        end else if (commit) begin
+            case (layer)
+                2'd1: for (rr = 0; rr < 16; rr = rr + 1) A[0][rr] <= A[0][(rr + 8) % 16];
+                2'd3: for (rr = 0; rr < 16; rr = rr + 1) A[0][rr] <= newv[2][(rr + 8) % 16];
+                default: ; // layer0 absent; layer2 self-rotate delta 0 (hold)
+            endcase
+        end
+    end
+
+    always @(posedge clk) begin
+        if (state == S_RUN) begin
+            case (layer)
+                2'd1: for (rr = 0; rr < 16; rr = rr + 1) B[0][rr] <= newv[0][(rr + 8) % 16];
+                2'd2: for (rr = 0; rr < 16; rr = rr + 1) B[0][rr] <= newv[1][rr];
+                default: ;
+            endcase
+        end
+    end
+
+    // ---- column 1 : inject 1, read 2, edge = 0
+    always @(posedge clk) begin
+        if ((state == S_LOAD) && in_data_valid && (io_cnt[6:4] == 3'd1)) begin
+            for (rr = 0; rr < 16; rr = rr + 1)
+                A[1][rr] <= (rr == 1) ? inj_val : A[1][(rr + 1) % 16];
+        end else if ((state == S_OUT) && (io_cnt[6:4] == 3'd1)) begin
+            for (rr = 0; rr < 16; rr = rr + 1)
+                A[1][rr] <= A[1][(rr + 1) % 16];
+        end else if (commit) begin
+            case (layer)
+                2'd0: for (rr = 0; rr < 16; rr = rr + 1) A[1][rr] <= A[1][(rr + 4) % 16];
+                2'd2: for (rr = 0; rr < 16; rr = rr + 1) A[1][rr] <= A[1][(rr + 4) % 16];
+                2'd3: for (rr = 0; rr < 16; rr = rr + 1) A[1][rr] <= newv[0][(rr + 8) % 16];
+                default: ; // layer1 absent
+            endcase
+        end
+    end
+
+    always @(posedge clk) begin
+        if (state == S_RUN) begin
+            case (layer)
+                2'd0: for (rr = 0; rr < 16; rr = rr + 1) B[1][rr] <= newv[0][(rr + 4) % 16];
+                2'd2: for (rr = 0; rr < 16; rr = rr + 1) B[1][rr] <= newv[0][(rr + 4) % 16];
+                default: ;
+            endcase
+        end
+    end
+
+    // ---- column 2 : inject 5, read 6, edge = 1
+    always @(posedge clk) begin
+        if ((state == S_LOAD) && in_data_valid && (io_cnt[6:4] == 3'd2)) begin
+            for (rr = 0; rr < 16; rr = rr + 1)
+                A[2][rr] <= (rr == 5) ? inj_val : A[2][(rr + 1) % 16];
+        end else if ((state == S_OUT) && (io_cnt[6:4] == 3'd2)) begin
+            for (rr = 0; rr < 16; rr = rr + 1)
+                A[2][rr] <= A[2][(rr + 1) % 16];
+        end else if (commit) begin
+            case (layer)
+                2'd0: for (rr = 0; rr < 16; rr = rr + 1) A[2][rr] <= A[2][(rr + 4) % 16];
+                2'd1: for (rr = 0; rr < 16; rr = rr + 1) A[2][rr] <= A[2][(rr + 13) % 16];
+                2'd3: for (rr = 0; rr < 16; rr = rr + 1) A[2][rr] <= newv[1][(rr + 15) % 16];
+                default: ; // layer2 absent
+            endcase
+        end
+    end
+
+    always @(posedge clk) begin
+        if (state == S_RUN) begin
+            case (layer)
+                2'd0: for (rr = 0; rr < 16; rr = rr + 1) B[2][rr] <= newv[1][(rr + 4) % 16];
+                2'd1: for (rr = 0; rr < 16; rr = rr + 1) B[2][rr] <= newv[1][(rr + 13) % 16];
+                default: ;
+            endcase
+        end
+    end
+
+    // ---- column 3 : inject 13, read 14, edge = 2
+    always @(posedge clk) begin
+        if ((state == S_LOAD) && in_data_valid && (io_cnt[6:4] == 3'd3)) begin
+            for (rr = 0; rr < 16; rr = rr + 1)
+                A[3][rr] <= (rr == 13) ? inj_val : A[3][(rr + 1) % 16];
+        end else if ((state == S_OUT) && (io_cnt[6:4] == 3'd3)) begin
+            for (rr = 0; rr < 16; rr = rr + 1)
+                A[3][rr] <= A[3][(rr + 1) % 16];
+        end else if (commit) begin
+            case (layer)
+                2'd0: for (rr = 0; rr < 16; rr = rr + 1) A[3][rr] <= A[3][(rr + 8) % 16];
+                2'd1: for (rr = 0; rr < 16; rr = rr + 1) A[3][rr] <= A[3][(rr + 1) % 16];
+                2'd2: for (rr = 0; rr < 16; rr = rr + 1) A[3][rr] <= newv[2][(rr + 7) % 16];
+                default: ; // layer3 absent
+            endcase
+        end
+    end
+
+    always @(posedge clk) begin
+        if (state == S_RUN) begin
+            case (layer)
+                2'd0: for (rr = 0; rr < 16; rr = rr + 1) B[3][rr] <= newv[2][(rr + 8) % 16];
+                2'd1: for (rr = 0; rr < 16; rr = rr + 1) B[3][rr] <= newv[2][(rr + 1) % 16];
+                default: ;
+            endcase
+        end
+    end
+
+    // ---- column 4 : inject 2, read 3, edge = 3, present every layer
+    always @(posedge clk) begin
+        if ((state == S_LOAD) && in_data_valid && (io_cnt[6:4] == 3'd4)) begin
+            for (rr = 0; rr < 16; rr = rr + 1)
+                A[4][rr] <= (rr == 2) ? inj_val : A[4][(rr + 1) % 16];
+        end else if ((state == S_OUT) && (io_cnt[6:4] == 3'd4)) begin
+            for (rr = 0; rr < 16; rr = rr + 1)
+                A[4][rr] <= A[4][(rr + 1) % 16];
+        end else if (commit) begin
+            case (layer)
+                2'd0: for (rr = 0; rr < 16; rr = rr + 1) A[4][rr] <= A[4][(rr + 5) % 16];
+                2'd1: for (rr = 0; rr < 16; rr = rr + 1) A[4][rr] <= A[4][(rr + 5) % 16];
+                2'd2: for (rr = 0; rr < 16; rr = rr + 1) A[4][rr] <= A[4][(rr + 13) % 16];
+                2'd3: for (rr = 0; rr < 16; rr = rr + 1) A[4][rr] <= newv[3][(rr + 9) % 16];
+            endcase
+        end
+    end
+
+    always @(posedge clk) begin
+        if (state == S_RUN) begin
+            case (layer)
+                2'd0: for (rr = 0; rr < 16; rr = rr + 1) B[4][rr] <= newv[3][(rr + 5) % 16];
+                2'd1: for (rr = 0; rr < 16; rr = rr + 1) B[4][rr] <= newv[3][(rr + 5) % 16];
+                2'd2: for (rr = 0; rr < 16; rr = rr + 1) B[4][rr] <= newv[3][(rr + 13) % 16];
+                default: ;
+            endcase
+        end
+    end
+
+    // ---- column 5 : inject 3, read 4, edge = 4, present every layer
+    always @(posedge clk) begin
+        if ((state == S_LOAD) && in_data_valid && (io_cnt[6:4] == 3'd5)) begin
+            for (rr = 0; rr < 16; rr = rr + 1)
+                A[5][rr] <= (rr == 3) ? inj_val : A[5][(rr + 1) % 16];
+        end else if ((state == S_OUT) && (io_cnt[6:4] == 3'd5)) begin
+            for (rr = 0; rr < 16; rr = rr + 1)
+                A[5][rr] <= A[5][(rr + 1) % 16];
+        end else if (commit) begin
+            case (layer)
+                2'd0: for (rr = 0; rr < 16; rr = rr + 1) A[5][rr] <= A[5][(rr + 1) % 16];
+                2'd1: for (rr = 0; rr < 16; rr = rr + 1) A[5][rr] <= A[5][(rr + 2) % 16];
+                2'd2: for (rr = 0; rr < 16; rr = rr + 1) A[5][rr] <= A[5][(rr + 1) % 16];
+                2'd3: for (rr = 0; rr < 16; rr = rr + 1) A[5][rr] <= newv[4][(rr + 12) % 16];
+            endcase
+        end
+    end
+
+    always @(posedge clk) begin
+        if (state == S_RUN) begin
+            case (layer)
+                2'd0: for (rr = 0; rr < 16; rr = rr + 1) B[5][rr] <= newv[4][(rr + 1) % 16];
+                2'd1: for (rr = 0; rr < 16; rr = rr + 1) B[5][rr] <= newv[4][(rr + 2) % 16];
+                2'd2: for (rr = 0; rr < 16; rr = rr + 1) B[5][rr] <= newv[4][(rr + 1) % 16];
+                default: ;
+            endcase
+        end
+    end
+
+    // ---- column 6 : inject 6, read 7, edge = 5, present every layer
+    always @(posedge clk) begin
+        if ((state == S_LOAD) && in_data_valid && (io_cnt[6:4] == 3'd6)) begin
+            for (rr = 0; rr < 16; rr = rr + 1)
+                A[6][rr] <= (rr == 6) ? inj_val : A[6][(rr + 1) % 16];
+        end else if ((state == S_OUT) && (io_cnt[6:4] == 3'd6)) begin
+            for (rr = 0; rr < 16; rr = rr + 1)
+                A[6][rr] <= A[6][(rr + 1) % 16];
+        end else if (commit) begin
+            case (layer)
+                2'd0: for (rr = 0; rr < 16; rr = rr + 1) A[6][rr] <= A[6][(rr + 3) % 16];
+                2'd1: for (rr = 0; rr < 16; rr = rr + 1) A[6][rr] <= A[6][(rr + 14) % 16];
+                2'd2: for (rr = 0; rr < 16; rr = rr + 1) A[6][rr] <= A[6][(rr + 14) % 16];
+                2'd3: for (rr = 0; rr < 16; rr = rr + 1) A[6][rr] <= newv[5][(rr + 1) % 16];
+            endcase
+        end
+    end
+
+    always @(posedge clk) begin
+        if (state == S_RUN) begin
+            case (layer)
+                2'd0: for (rr = 0; rr < 16; rr = rr + 1) B[6][rr] <= newv[5][(rr + 3) % 16];
+                2'd1: for (rr = 0; rr < 16; rr = rr + 1) B[6][rr] <= newv[5][(rr + 14) % 16];
+                2'd2: for (rr = 0; rr < 16; rr = rr + 1) B[6][rr] <= newv[5][(rr + 14) % 16];
+                default: ;
+            endcase
+        end
+    end
+
+    // ---- column 7 : inject 12, read 13, edge = 6, present every layer
+    always @(posedge clk) begin
+        if ((state == S_LOAD) && in_data_valid && (io_cnt[6:4] == 3'd7)) begin
+            for (rr = 0; rr < 16; rr = rr + 1)
+                A[7][rr] <= (rr == 12) ? inj_val : A[7][(rr + 1) % 16];
+        end else if ((state == S_OUT) && (io_cnt[6:4] == 3'd7)) begin
+            for (rr = 0; rr < 16; rr = rr + 1)
+                A[7][rr] <= A[7][(rr + 1) % 16];
+        end else if (commit) begin
+            case (layer)
+                2'd0: for (rr = 0; rr < 16; rr = rr + 1) A[7][rr] <= A[7][(rr + 6) % 16];
+                2'd2: for (rr = 0; rr < 16; rr = rr + 1) A[7][rr] <= A[7][(rr + 10) % 16];
+                2'd3: for (rr = 0; rr < 16; rr = rr + 1) A[7][rr] <= newv[6][rr];
+                default: ; // layer1 self-rotate delta 0 (hold)
+            endcase
+        end
+    end
+
+    always @(posedge clk) begin
+        if (state == S_RUN) begin
+            case (layer)
+                2'd0: for (rr = 0; rr < 16; rr = rr + 1) B[7][rr] <= newv[6][(rr + 6) % 16];
+                2'd1: for (rr = 0; rr < 16; rr = rr + 1) B[7][rr] <= newv[6][rr];
+                2'd2: for (rr = 0; rr < 16; rr = rr + 1) B[7][rr] <= newv[6][(rr + 10) % 16];
+                default: ;
+            endcase
+        end
+    end
+
+    //============================================================
+    // Syndrome network: fixed XOR wiring on A's sign bits.
+    // rot_amt[n][c] = (BG[n][c] - tf[c]) mod 16, tf = [5,14,10,2,13,12,9,3].
+    //============================================================
 
     function [15:0] rotate_read16;
         input [15:0] value;
@@ -220,702 +622,87 @@ module LDPC (
         end
     endfunction
 
-    //============================================================
-    // Fixed QC-H gather routing
-    //============================================================
-
-    integer route_lane_i;
-    integer route_edge_i;
-    always @(*) begin : PAIR_VECTOR
-        for (route_edge_i = 0; route_edge_i < EDGE_COUNT;
-             route_edge_i = route_edge_i + 1) begin
-            for (route_lane_i = 0; route_lane_i < CNU_COUNT;
-                 route_lane_i = route_lane_i + 1) begin
-                pair_vector[route_edge_i][route_lane_i] = 16'd0;
-            end
-        end
-
-        case (layer)
-            2'd0: begin
-                for (route_lane_i = 0; route_lane_i < CNU_COUNT;
-                     route_lane_i = route_lane_i + 1) begin
-                    pair_vector[0][route_lane_i] = batch ?
-                        {Ljb[1][(route_lane_i+6 )&15], Lja[1][(route_lane_i+6 )&15]} :
-                        {Ljb[1][(route_lane_i+14)&15], Lja[1][(route_lane_i+14)&15]};
-                    pair_vector[1][route_lane_i] = batch ?
-                        {Ljb[2][(route_lane_i+2 )&15], Lja[2][(route_lane_i+2 )&15]} :
-                        {Ljb[2][(route_lane_i+10)&15], Lja[2][(route_lane_i+10)&15]};
-                    pair_vector[2][route_lane_i] = batch ?
-                        {Ljb[3][(route_lane_i+10)&15], Lja[3][(route_lane_i+10)&15]} :
-                        {Ljb[3][(route_lane_i+2 )&15], Lja[3][(route_lane_i+2 )&15]};
-                    pair_vector[3][route_lane_i] = batch ?
-                        {Ljb[4][(route_lane_i+5 )&15], Lja[4][(route_lane_i+5 )&15]} :
-                        {Ljb[4][(route_lane_i+13)&15], Lja[4][(route_lane_i+13)&15]};
-                    pair_vector[4][route_lane_i] = batch ?
-                        {Ljb[5][(route_lane_i+4 )&15], Lja[5][(route_lane_i+4 )&15]} :
-                        {Ljb[5][(route_lane_i+12)&15], Lja[5][(route_lane_i+12)&15]};
-                    pair_vector[5][route_lane_i] = batch ?
-                        {Ljb[6][(route_lane_i+1 )&15], Lja[6][(route_lane_i+1 )&15]} :
-                        {Ljb[6][(route_lane_i+9 )&15], Lja[6][(route_lane_i+9 )&15]};
-                    pair_vector[6][route_lane_i] = batch ?
-                        {Ljb[7][(route_lane_i+11)&15], Lja[7][(route_lane_i+11)&15]} :
-                        {Ljb[7][(route_lane_i+3 )&15], Lja[7][(route_lane_i+3 )&15]};
-                end
-            end
-
-            2'd1: begin
-                for (route_lane_i = 0; route_lane_i < CNU_COUNT;
-                     route_lane_i = route_lane_i + 1) begin
-                    pair_vector[0][route_lane_i] = batch ?
-                        {Ljb[0][(route_lane_i+13)&15], Lja[0][(route_lane_i+13)&15]} :
-                        {Ljb[0][(route_lane_i+5 )&15], Lja[0][(route_lane_i+5 )&15]};
-                    pair_vector[1][route_lane_i] = batch ?
-                        {Ljb[2][(route_lane_i+6 )&15], Lja[2][(route_lane_i+6 )&15]} :
-                        {Ljb[2][(route_lane_i+14)&15], Lja[2][(route_lane_i+14)&15]};
-                    pair_vector[2][route_lane_i] = batch ?
-                        {Ljb[3][(route_lane_i+2 )&15], Lja[3][(route_lane_i+2 )&15]} :
-                        {Ljb[3][(route_lane_i+10)&15], Lja[3][(route_lane_i+10)&15]};
-                    pair_vector[3][route_lane_i] = batch ?
-                        {Ljb[4][(route_lane_i+10)&15], Lja[4][(route_lane_i+10)&15]} :
-                        {Ljb[4][(route_lane_i+2 )&15], Lja[4][(route_lane_i+2 )&15]};
-                    pair_vector[4][route_lane_i] = batch ?
-                        {Ljb[5][(route_lane_i+5 )&15], Lja[5][(route_lane_i+5 )&15]} :
-                        {Ljb[5][(route_lane_i+13)&15], Lja[5][(route_lane_i+13)&15]};
-                    pair_vector[5][route_lane_i] = batch ?
-                        {Ljb[6][(route_lane_i+4 )&15], Lja[6][(route_lane_i+4 )&15]} :
-                        {Ljb[6][(route_lane_i+12)&15], Lja[6][(route_lane_i+12)&15]};
-                    pair_vector[6][route_lane_i] = batch ?
-                        {Ljb[7][(route_lane_i+1 )&15], Lja[7][(route_lane_i+1 )&15]} :
-                        {Ljb[7][(route_lane_i+9 )&15], Lja[7][(route_lane_i+9 )&15]};
-                end
-            end
-
-            2'd2: begin
-                for (route_lane_i = 0; route_lane_i < CNU_COUNT;
-                     route_lane_i = route_lane_i + 1) begin
-                    pair_vector[0][route_lane_i] = batch ?
-                        {Ljb[0][(route_lane_i+8)&15], Lja[0][(route_lane_i+8)&15]} :
-                        {Ljb[0][route_lane_i],        Lja[0][route_lane_i]};
-                    pair_vector[1][route_lane_i] = batch ?
-                        {Ljb[1][(route_lane_i+13)&15], Lja[1][(route_lane_i+13)&15]} :
-                        {Ljb[1][(route_lane_i+5 )&15], Lja[1][(route_lane_i+5 )&15]};
-                    pair_vector[2][route_lane_i] = batch ?
-                        {Ljb[3][(route_lane_i+6 )&15], Lja[3][(route_lane_i+6 )&15]} :
-                        {Ljb[3][(route_lane_i+14)&15], Lja[3][(route_lane_i+14)&15]};
-                    pair_vector[3][route_lane_i] = batch ?
-                        {Ljb[4][(route_lane_i+2 )&15], Lja[4][(route_lane_i+2 )&15]} :
-                        {Ljb[4][(route_lane_i+10)&15], Lja[4][(route_lane_i+10)&15]};
-                    pair_vector[4][route_lane_i] = batch ?
-                        {Ljb[5][(route_lane_i+10)&15], Lja[5][(route_lane_i+10)&15]} :
-                        {Ljb[5][(route_lane_i+2 )&15], Lja[5][(route_lane_i+2 )&15]};
-                    pair_vector[5][route_lane_i] = batch ?
-                        {Ljb[6][(route_lane_i+5 )&15], Lja[6][(route_lane_i+5 )&15]} :
-                        {Ljb[6][(route_lane_i+13)&15], Lja[6][(route_lane_i+13)&15]};
-                    pair_vector[6][route_lane_i] = batch ?
-                        {Ljb[7][(route_lane_i+4 )&15], Lja[7][(route_lane_i+4 )&15]} :
-                        {Ljb[7][(route_lane_i+12)&15], Lja[7][(route_lane_i+12)&15]};
-                end
-            end
-
-            2'd3: begin
-                for (route_lane_i = 0; route_lane_i < CNU_COUNT;
-                     route_lane_i = route_lane_i + 1) begin
-                    pair_vector[0][route_lane_i] = batch ?
-                        {Ljb[0][(route_lane_i+15)&15], Lja[0][(route_lane_i+15)&15]} :
-                        {Ljb[0][(route_lane_i+7 )&15], Lja[0][(route_lane_i+7 )&15]};
-                    pair_vector[1][route_lane_i] = batch ?
-                        {Ljb[1][(route_lane_i+8)&15], Lja[1][(route_lane_i+8)&15]} :
-                        {Ljb[1][route_lane_i],       Lja[1][route_lane_i]};
-                    pair_vector[2][route_lane_i] = batch ?
-                        {Ljb[2][(route_lane_i+13)&15], Lja[2][(route_lane_i+13)&15]} :
-                        {Ljb[2][(route_lane_i+5 )&15], Lja[2][(route_lane_i+5 )&15]};
-                    pair_vector[3][route_lane_i] = batch ?
-                        {Ljb[4][(route_lane_i+6 )&15], Lja[4][(route_lane_i+6 )&15]} :
-                        {Ljb[4][(route_lane_i+14)&15], Lja[4][(route_lane_i+14)&15]};
-                    pair_vector[4][route_lane_i] = batch ?
-                        {Ljb[5][(route_lane_i+2 )&15], Lja[5][(route_lane_i+2 )&15]} :
-                        {Ljb[5][(route_lane_i+10)&15], Lja[5][(route_lane_i+10)&15]};
-                    pair_vector[5][route_lane_i] = batch ?
-                        {Ljb[6][(route_lane_i+10)&15], Lja[6][(route_lane_i+10)&15]} :
-                        {Ljb[6][(route_lane_i+2 )&15], Lja[6][(route_lane_i+2 )&15]};
-                    pair_vector[6][route_lane_i] = batch ?
-                        {Ljb[7][(route_lane_i+5 )&15], Lja[7][(route_lane_i+5 )&15]} :
-                        {Ljb[7][(route_lane_i+13)&15], Lja[7][(route_lane_i+13)&15]};
-                end
-            end
-
-            default: begin
-            end
-        endcase
-    end
-
-    //============================================================
-    // FSM and frame control
-    //============================================================
-
-    always @(*) begin : STATE_NEXT
-        next_state_c = state;
-        case (state)
-            S_IDLE: begin
-                if (in_mode_valid && !out_valid)
-                    next_state_c = S_READ;
-            end
-            S_READ: begin
-                if (in_data_valid && (read_idx == 7'd126))
-                    next_state_c = S_LDPC;
-            end
-            S_LDPC: begin
-                if (stop_now)
-                    next_state_c = S_OUTPUT;
-            end
-            S_OUTPUT: begin
-                if (output_idx == 7'd127)
-                    next_state_c = S_IDLE;
-            end
-            default: begin
-                next_state_c = S_IDLE;
-            end
-        endcase
-    end
-
-    always @(posedge clk or negedge rst_n) begin : FSM_STATE
-        if (!rst_n)
-            state <= S_IDLE;
-        else
-            state <= next_state_c;
-    end
-
-    always @(posedge clk or negedge rst_n) begin : MODE_CONTROL
-        if (!rst_n)
-            mode_reg <= 1'b0;
-        else if (in_mode_valid && (state == S_IDLE) && !out_valid)
-            mode_reg <= in_mode;
-    end
-
-    always @(posedge clk or negedge rst_n) begin : READ_INDEX
-        if (!rst_n) begin
-            read_idx <= 7'd0;
-        end else if (in_mode_valid && (state == S_IDLE) && !out_valid) begin
-            read_idx <= 7'd0;
-        end else if ((state == S_READ) && in_data_valid) begin
-            read_idx <= read_idx + 7'd1;
-        end else if (late_input_write) begin
-            read_idx <= 7'd0;
-        end
-    end
-
-    always @(posedge clk or negedge rst_n) begin : LDPC_COUNTER
-        if (!rst_n) begin
-            iteration_cnt <= 4'd0;
-            cnu8_cnt <= 3'd0;
-        end else if (in_mode_valid && (state == S_IDLE) && !out_valid) begin
-            iteration_cnt <= 4'd0;
-            cnu8_cnt <= 3'd0;
-        end else if (state == S_LDPC) begin
-            if (stop_now) begin
-                cnu8_cnt <= 3'd0;
-            end else if (ldpc_commit) begin
-                if (cnu8_cnt == 3'd7) begin
-                    cnu8_cnt <= 3'd0;
-                    iteration_cnt <= iteration_cnt + 4'd1;
-                end else begin
-                    cnu8_cnt <= cnu8_cnt + 3'd1;
-                end
-            end
-        end
-    end
-
-    //============================================================
-    // Old C2V reconstruction and edge arithmetic
-    //============================================================
-
-    reg        [4:0] min1_old    [0:7];
-    reg        [4:0] min2_old    [0:7];
-    reg        [2:0] min1_idx    [0:7];
-    reg        [6:0] c2v_neg     [0:7];
-    reg        [4:0] r_old_mag   [0:7][0:6];
-    reg        [7:0] r_sub_operand [0:7][0:6];
-    reg              r_sub_carry   [0:7][0:6];
-    reg        [8:0] a_base_sum  [0:7][0:6];
-    reg        [8:0] b_base_sum  [0:7][0:6];
-    reg signed [7:0] a_base      [0:7][0:6];
-    reg signed [7:0] b_base      [0:7][0:6];
-    reg signed [7:0] q_base      [0:7][0:6];
-    reg        [5:0] q_sm        [0:7][0:6];
-    reg signed [7:0] update_base [0:7][0:6];
-    reg              use_q_base  [0:6];
-    reg              update_bank_sel [0:6];
-
-    reg [6:0] first_touch_edge;
-    always @(*) begin : FIRST_TOUCH
-        case (layer)
-            2'd0: first_touch_edge = 7'b1111111;
-            2'd1: first_touch_edge = 7'b0000001;
-            default: first_touch_edge = 7'b0000000;
-        endcase
-    end
-
-    integer cnu_i;
-    integer edge_i;
-    always @(*) begin : CNU_INPUT
-        for (edge_i = 0; edge_i < EDGE_COUNT; edge_i = edge_i + 1) begin
-            use_q_base[edge_i] = mode_reg || first_touch_edge[edge_i];
-            update_bank_sel[edge_i] = current_bank_sel ^
-                                      ~use_q_base[edge_i];
-        end
-
-        for (cnu_i = 0; cnu_i < CNU_COUNT; cnu_i = cnu_i + 1) begin
-            if (old_c2v_valid) begin
-                min1_old[cnu_i] = c2v_queue[0][cnu_i][19:15];
-                min2_old[cnu_i] = c2v_queue[0][cnu_i][14:10];
-                min1_idx[cnu_i] = c2v_queue[0][cnu_i][9:7];
-                c2v_neg[cnu_i]  = c2v_queue[0][cnu_i][6:0];
-            end else begin
-                min1_old[cnu_i] = 5'd0;
-                min2_old[cnu_i] = 5'd0;
-                min1_idx[cnu_i] = 3'd0;
-                c2v_neg[cnu_i]  = 7'd0;
-            end
-
-<<<<<<< HEAD
-        if (state == S_LDPC) begin
-            for (cnu_i = 0; cnu_i < CNU_COUNT; cnu_i = cnu_i + 1) begin
-                if (!zero_old) begin
-                    min1_old[cnu_i] = c2v[layer][batch][cnu_i][19:15];
-                    min2_old[cnu_i] = c2v[layer][batch][cnu_i][14:10];
-                    min1_idx[cnu_i] = c2v[layer][batch][cnu_i][9:7];
-                    c2v_neg[cnu_i]  = c2v[layer][batch][cnu_i][6:0];
-                end
-
-                for (edge_i = 0; edge_i < EDGE_COUNT; edge_i = edge_i + 1) begin
-                    if (zero_old) begin
-                        r_old_mag[cnu_i][edge_i] = 5'd0;
-                        r_old[cnu_i][edge_i] = 6'sd0;
-                    end else begin
-                        if (min1_idx[cnu_i] == edge_i)
-                            r_old_mag[cnu_i][edge_i] = min2_old[cnu_i];
-                        else
-                            r_old_mag[cnu_i][edge_i] = min1_old[cnu_i];
-
-                        if (c2v_neg[cnu_i][edge_i])
-                            r_old[cnu_i][edge_i] =
-                                -$signed({1'b0, r_old_mag[cnu_i][edge_i]});
-                        else
-                            r_old[cnu_i][edge_i] =
-                                 $signed({1'b0, r_old_mag[cnu_i][edge_i]});
-                    end
-
-                    r_old_ext[cnu_i][edge_i] =
-                        {{2{r_old[cnu_i][edge_i][5]}}, r_old[cnu_i][edge_i]};
-                    q_base[cnu_i][edge_i] =
-                        src_vector[edge_i][cnu_i] - r_old_ext[cnu_i][edge_i];
-                    dst_base[cnu_i][edge_i] =
-                        dst_vector[edge_i][cnu_i] - r_old_ext[cnu_i][edge_i];
-                    q_msg[cnu_i][edge_i] = clip6(q_base[cnu_i][edge_i]);
-
-                    if (mode_reg || first_touch_edge[edge_i])
-                        update_base[cnu_i][edge_i] = q_base[cnu_i][edge_i];
-                    else
-                        update_base[cnu_i][edge_i] = dst_base[cnu_i][edge_i];
-=======
-            for (edge_i = 0; edge_i < EDGE_COUNT; edge_i = edge_i + 1) begin
-                if (min1_idx[cnu_i] == edge_i)
-                    r_old_mag[cnu_i][edge_i] = min2_old[cnu_i];
-                else
-                    r_old_mag[cnu_i][edge_i] = min1_old[cnu_i];
-
-                // Subtract R_old from both physical banks before selecting
-                // either the source value or the accumulation destination.
-                r_sub_carry[cnu_i][edge_i] =
-                    ~c2v_neg[cnu_i][edge_i];
-                r_sub_operand[cnu_i][edge_i] =
-                    {3'b000, r_old_mag[cnu_i][edge_i]} ^
-                    {8{r_sub_carry[cnu_i][edge_i]}};
-
-                a_base_sum[cnu_i][edge_i] =
-                    {1'b0, pair_vector[edge_i][cnu_i][7:0]} +
-                    {1'b0, r_sub_operand[cnu_i][edge_i]} +
-                    r_sub_carry[cnu_i][edge_i];
-                b_base_sum[cnu_i][edge_i] =
-                    {1'b0, pair_vector[edge_i][cnu_i][15:8]} +
-                    {1'b0, r_sub_operand[cnu_i][edge_i]} +
-                    r_sub_carry[cnu_i][edge_i];
-                a_base[cnu_i][edge_i] =
-                    $signed(a_base_sum[cnu_i][edge_i][7:0]);
-                b_base[cnu_i][edge_i] =
-                    $signed(b_base_sum[cnu_i][edge_i][7:0]);
-
-                if (current_bank_sel)
-                    q_base[cnu_i][edge_i] = b_base[cnu_i][edge_i];
-                else
-                    q_base[cnu_i][edge_i] = a_base[cnu_i][edge_i];
-
-                if (update_bank_sel[edge_i])
-                    update_base[cnu_i][edge_i] = b_base[cnu_i][edge_i];
-                else
-                    update_base[cnu_i][edge_i] = a_base[cnu_i][edge_i];
-
-                // clip6(q_base) followed by abs6 is represented directly as
-                // one sign bit and one saturated five-bit magnitude.
-                q_sm[cnu_i][edge_i][5] = q_base[cnu_i][edge_i][7];
-                if ((q_base[cnu_i][edge_i][6] ^
-                     q_base[cnu_i][edge_i][7]) ||
-                    (q_base[cnu_i][edge_i][5] ^
-                     q_base[cnu_i][edge_i][7]) ||
-                    (q_base[cnu_i][edge_i][7] &&
-                     (q_base[cnu_i][edge_i][4:0] == 5'd0))) begin
-                    q_sm[cnu_i][edge_i][4:0] = 5'd31;
-                end else if (q_base[cnu_i][edge_i][7]) begin
-                    q_sm[cnu_i][edge_i][4:0] =
-                        (~q_base[cnu_i][edge_i][4:0]) + 5'd1;
-                end else begin
-                    q_sm[cnu_i][edge_i][4:0] =
-                        q_base[cnu_i][edge_i][4:0];
->>>>>>> 8CNU_03fail
-                end
-            end
-        end
-    end
-
-    wire        [19:0] c2v_new_lane    [0:7];
-    wire        [41:0] r_new_flat_lane [0:7];
-    wire signed  [5:0] r_new            [0:7][0:6];
-    wire signed  [7:0] r_new_ext        [0:7][0:6];
-    wire signed  [7:0] new_lj           [0:7][0:6];
-
-    genvar cnu_g;
-    genvar edge_g;
+    wire [15:0] hard [0:7];
+    genvar hc, hr;
     generate
-        for (cnu_g = 0; cnu_g < CNU_COUNT; cnu_g = cnu_g + 1) begin : GEN_CNU
-            CNU_lane u_CNU_lane (
-                .q_sm0(q_sm[cnu_g][0]),
-                .q_sm1(q_sm[cnu_g][1]),
-                .q_sm2(q_sm[cnu_g][2]),
-                .q_sm3(q_sm[cnu_g][3]),
-                .q_sm4(q_sm[cnu_g][4]),
-                .q_sm5(q_sm[cnu_g][5]),
-                .q_sm6(q_sm[cnu_g][6]),
-                .c2v_new(c2v_new_lane[cnu_g]),
-                .r_new_flat(r_new_flat_lane[cnu_g])
-            );
-
-            for (edge_g = 0; edge_g < EDGE_COUNT; edge_g = edge_g + 1) begin : GEN_NEW_LJ
-                assign r_new[cnu_g][edge_g] =
-                    r_new_flat_lane[cnu_g][edge_g*6 +: 6];
-                assign r_new_ext[cnu_g][edge_g] =
-                    {{2{r_new[cnu_g][edge_g][5]}}, r_new[cnu_g][edge_g]};
-                assign new_lj[cnu_g][edge_g] =
-                    $signed(update_base[cnu_g][edge_g]) +
-                    $signed(r_new_ext[cnu_g][edge_g]);
+        for (hc = 0; hc < 8; hc = hc + 1) begin: HARD_COL
+            for (hr = 0; hr < 16; hr = hr + 1) begin: HARD_ROW
+                assign hard[hc][hr] = A[hc][hr][7];
             end
         end
     endgenerate
 
+    wire [15:0] syn0, syn1, syn2, syn3;
+
+    assign syn0 = hard[1] ^ hard[2] ^ hard[3] ^ hard[4] ^ hard[5] ^ hard[6] ^ hard[7];
+
+    assign syn1 = hard[0]
+                ^ rotate_read16(hard[2], 4'd4)
+                ^ rotate_read16(hard[3], 4'd8)
+                ^ rotate_read16(hard[4], 4'd5)
+                ^ rotate_read16(hard[5], 4'd1)
+                ^ rotate_read16(hard[6], 4'd3)
+                ^ rotate_read16(hard[7], 4'd6);
+
+    assign syn2 = rotate_read16(hard[0], 4'd11)
+                ^ rotate_read16(hard[1], 4'd7)
+                ^ rotate_read16(hard[3], 4'd12)
+                ^ rotate_read16(hard[4], 4'd13)
+                ^ rotate_read16(hard[5], 4'd6)
+                ^ rotate_read16(hard[6], 4'd4)
+                ^ rotate_read16(hard[7], 4'd9);
+
+    assign syn3 = rotate_read16(hard[0], 4'd2)
+                ^ rotate_read16(hard[1], 4'd2)
+                ^ rotate_read16(hard[2], 4'd11)
+                ^ rotate_read16(hard[4], 4'd1)
+                ^ rotate_read16(hard[5], 4'd14)
+                ^ rotate_read16(hard[6], 4'd9)
+                ^ rotate_read16(hard[7], 4'd10);
+
+    assign syndrome_nonzero = |(syn0 | syn1 | syn2 | syn3);
+
     //============================================================
-    // Posterior and descriptor writeback
+    // Output: rotate-by-1 read, fixed point per column, 8:1 column mux.
+    // pr = [11,2,6,14,3,4,7,13] for columns 0..7.
     //============================================================
 
-    function [2:0] h_edge_for_col;
-        input [1:0] layer_i;
-        input [2:0] col_i;
-        begin
-            if (col_i == {1'b0, layer_i})
-                h_edge_for_col = 3'd0;
-            else if (col_i > {1'b0, layer_i})
-                h_edge_for_col = col_i - 3'd1;
-            else
-                h_edge_for_col = col_i;
-        end
-    endfunction
+    wire [2:0] eff_col = stop_now ? 3'd0 : io_cnt[6:4];
 
-    function [3:0] h_shift_for_col;
-        input [1:0] layer_i;
-        input [2:0] col_i;
-        begin
-            h_shift_for_col = 4'd0;
-            case ({layer_i, col_i})
-                {2'd0, 3'd1}: h_shift_for_col = 4'd14;
-                {2'd0, 3'd2}: h_shift_for_col = 4'd10;
-                {2'd0, 3'd3}: h_shift_for_col = 4'd2;
-                {2'd0, 3'd4}: h_shift_for_col = 4'd13;
-                {2'd0, 3'd5}: h_shift_for_col = 4'd12;
-                {2'd0, 3'd6}: h_shift_for_col = 4'd9;
-                {2'd0, 3'd7}: h_shift_for_col = 4'd3;
-
-                {2'd1, 3'd0}: h_shift_for_col = 4'd5;
-                {2'd1, 3'd2}: h_shift_for_col = 4'd14;
-                {2'd1, 3'd3}: h_shift_for_col = 4'd10;
-                {2'd1, 3'd4}: h_shift_for_col = 4'd2;
-                {2'd1, 3'd5}: h_shift_for_col = 4'd13;
-                {2'd1, 3'd6}: h_shift_for_col = 4'd12;
-                {2'd1, 3'd7}: h_shift_for_col = 4'd9;
-
-                {2'd2, 3'd0}: h_shift_for_col = 4'd0;
-                {2'd2, 3'd1}: h_shift_for_col = 4'd5;
-                {2'd2, 3'd3}: h_shift_for_col = 4'd14;
-                {2'd2, 3'd4}: h_shift_for_col = 4'd10;
-                {2'd2, 3'd5}: h_shift_for_col = 4'd2;
-                {2'd2, 3'd6}: h_shift_for_col = 4'd13;
-                {2'd2, 3'd7}: h_shift_for_col = 4'd12;
-
-                {2'd3, 3'd0}: h_shift_for_col = 4'd7;
-                {2'd3, 3'd1}: h_shift_for_col = 4'd0;
-                {2'd3, 3'd2}: h_shift_for_col = 4'd5;
-                {2'd3, 3'd4}: h_shift_for_col = 4'd14;
-                {2'd3, 3'd5}: h_shift_for_col = 4'd10;
-                {2'd3, 3'd6}: h_shift_for_col = 4'd2;
-                {2'd3, 3'd7}: h_shift_for_col = 4'd13;
-                default: h_shift_for_col = 4'd0;
-            endcase
-        end
-    endfunction
-
-    reg  [7:0]  phase_sel;
-    reg  [7:0]  read_col_sel;
-    reg  [15:0] read_pos_sel;
-    wire         write_lja;
-
-    assign write_lja = mode_reg || current_bank_sel;
-
-    always @(*) begin : SHARED_WRITE_DECODE
-        phase_sel = 8'd0;
-        phase_sel[cnu8_cnt] = 1'b1;
-        read_col_sel = 8'd0;
-        read_col_sel[read_idx[6:4]] = 1'b1;
-        read_pos_sel = 16'd0;
-        read_pos_sel[read_idx[3:0]] = 1'b1;
+    reg signed [7:0] out_data_comb;
+    always @(*) begin
+        case (eff_col)
+            3'd0: out_data_comb = A[0][11];
+            3'd1: out_data_comb = A[1][2];
+            3'd2: out_data_comb = A[2][6];
+            3'd3: out_data_comb = A[3][14];
+            3'd4: out_data_comb = A[4][3];
+            3'd5: out_data_comb = A[5][4];
+            3'd6: out_data_comb = A[6][7];
+            default: out_data_comb = A[7][13];
+        endcase
     end
 
-    genvar wb_col_g;
-    genvar wb_pos_g;
-    generate
-        for (wb_col_g = 0; wb_col_g < 8;
-             wb_col_g = wb_col_g + 1) begin : GEN_WB_COL
-            for (wb_pos_g = 0; wb_pos_g < 16;
-                 wb_pos_g = wb_pos_g + 1) begin : GEN_WB_POS
-                localparam [2:0] WB_EDGE0 =
-                    h_edge_for_col(2'd0, wb_col_g);
-                localparam [2:0] WB_EDGE1 =
-                    h_edge_for_col(2'd1, wb_col_g);
-                localparam [2:0] WB_EDGE2 =
-                    h_edge_for_col(2'd2, wb_col_g);
-                localparam [2:0] WB_EDGE3 =
-                    h_edge_for_col(2'd3, wb_col_g);
-
-                localparam [3:0] WB_SHIFT0 =
-                    h_shift_for_col(2'd0, wb_col_g);
-                localparam [3:0] WB_SHIFT1 =
-                    h_shift_for_col(2'd1, wb_col_g);
-                localparam [3:0] WB_SHIFT2 =
-                    h_shift_for_col(2'd2, wb_col_g);
-                localparam [3:0] WB_SHIFT3 =
-                    h_shift_for_col(2'd3, wb_col_g);
-
-                localparam integer WB_ROW0 =
-                    (wb_pos_g + 16 - WB_SHIFT0) & 15;
-                localparam integer WB_ROW1 =
-                    (wb_pos_g + 16 - WB_SHIFT1) & 15;
-                localparam integer WB_ROW2 =
-                    (wb_pos_g + 16 - WB_SHIFT2) & 15;
-                localparam integer WB_ROW3 =
-                    (wb_pos_g + 16 - WB_SHIFT3) & 15;
-
-                localparam integer WB_LANE0 = WB_ROW0 & 7;
-                localparam integer WB_LANE1 = WB_ROW1 & 7;
-                localparam integer WB_LANE2 = WB_ROW2 & 7;
-                localparam integer WB_LANE3 = WB_ROW3 & 7;
-
-                localparam integer WB_PHASE0 = (WB_ROW0 >> 3);
-                localparam integer WB_PHASE1 = 2 + (WB_ROW1 >> 3);
-                localparam integer WB_PHASE2 = 4 + (WB_ROW2 >> 3);
-                localparam integer WB_PHASE3 = 6 + (WB_ROW3 >> 3);
-
-                wire wb_sel0;
-                wire wb_sel1;
-                wire wb_sel2;
-                wire wb_sel3;
-                wire wb_hit;
-                wire signed [7:0] wb_data;
-
-                assign wb_sel0 = (wb_col_g != 0) ?
-                                 phase_sel[WB_PHASE0] : 1'b0;
-                assign wb_sel1 = (wb_col_g != 1) ?
-                                 phase_sel[WB_PHASE1] : 1'b0;
-                assign wb_sel2 = (wb_col_g != 2) ?
-                                 phase_sel[WB_PHASE2] : 1'b0;
-                assign wb_sel3 = (wb_col_g != 3) ?
-                                 phase_sel[WB_PHASE3] : 1'b0;
-                assign wb_hit = wb_sel0 || wb_sel1 || wb_sel2 || wb_sel3;
-
-                assign wb_data =
-                    ({8{wb_sel0}} & new_lj[WB_LANE0][WB_EDGE0]) |
-                    ({8{wb_sel1}} & new_lj[WB_LANE1][WB_EDGE1]) |
-                    ({8{wb_sel2}} & new_lj[WB_LANE2][WB_EDGE2]) |
-                    ({8{wb_sel3}} & new_lj[WB_LANE3][WB_EDGE3]);
-
-                // Each physical Lj word has exactly one sequential owner.
-                // Priority matches the original nonblocking assignment order.
-                always @(posedge clk) begin
-                    if (late_input_write &&
-                        (wb_col_g == 7) && (wb_pos_g == 15)) begin
-                        Lja[wb_col_g][wb_pos_g] <=
-                            {{2{in_data[5]}}, in_data};
-                    end else if (ldpc_commit && wb_hit && write_lja) begin
-                        Lja[wb_col_g][wb_pos_g] <= wb_data;
-                    end else if ((state == S_READ) && in_data_valid &&
-                                 read_col_sel[wb_col_g] &&
-                                 read_pos_sel[wb_pos_g]) begin
-                        Lja[wb_col_g][wb_pos_g] <=
-                            {{2{in_data[5]}}, in_data};
-                    end
-
-                    if (ldpc_commit && wb_hit && !write_lja)
-                        Ljb[wb_col_g][wb_pos_g] <= wb_data;
-                end
-            end
-        end
-    endgenerate
-
-    integer c2v_stage_i;
-    integer c2v_lane_i;
-    always @(posedge clk) begin : C2V_QUEUE_WRITEBACK
-        if (ldpc_commit) begin
-            for (c2v_stage_i = 0; c2v_stage_i < 7;
-                 c2v_stage_i = c2v_stage_i + 1) begin
-                for (c2v_lane_i = 0; c2v_lane_i < CNU_COUNT;
-                     c2v_lane_i = c2v_lane_i + 1) begin
-                    c2v_queue[c2v_stage_i][c2v_lane_i] <=
-                        c2v_queue[c2v_stage_i+1][c2v_lane_i];
-                end
-            end
-            for (c2v_lane_i = 0; c2v_lane_i < CNU_COUNT;
-                 c2v_lane_i = c2v_lane_i + 1) begin
-                c2v_queue[7][c2v_lane_i] <=
-                    c2v_new_lane[c2v_lane_i];
-            end
-        end
-    end
-
-    //============================================================
-    // Fixed QC syndrome network
-    //============================================================
-
-    reg [15:0] hard0;
-    reg [15:0] hard1;
-    reg [15:0] hard2;
-    reg [15:0] hard3;
-    reg [15:0] hard4;
-    reg [15:0] hard5;
-    reg [15:0] hard6;
-    reg [15:0] hard7;
-
-    integer hard_i;
-    always @(*) begin : HARD_DECISION
-        for (hard_i = 0; hard_i < 16; hard_i = hard_i + 1) begin
-            if (current_bank_sel) begin
-                hard0[hard_i] = Ljb[0][hard_i][7];
-                hard1[hard_i] = Ljb[1][hard_i][7];
-                hard2[hard_i] = Ljb[2][hard_i][7];
-                hard3[hard_i] = Ljb[3][hard_i][7];
-                hard4[hard_i] = Ljb[4][hard_i][7];
-                hard5[hard_i] = Ljb[5][hard_i][7];
-                hard6[hard_i] = Ljb[6][hard_i][7];
-                hard7[hard_i] = Ljb[7][hard_i][7];
-            end else begin
-                hard0[hard_i] = Lja[0][hard_i][7];
-                hard1[hard_i] = Lja[1][hard_i][7];
-                hard2[hard_i] = Lja[2][hard_i][7];
-                hard3[hard_i] = Lja[3][hard_i][7];
-                hard4[hard_i] = Lja[4][hard_i][7];
-                hard5[hard_i] = Lja[5][hard_i][7];
-                hard6[hard_i] = Lja[6][hard_i][7];
-                hard7[hard_i] = Lja[7][hard_i][7];
-            end
-        end
-    end
-
-    wire [15:0] syn0_pair0;
-    wire [15:0] syn0_pair1;
-    wire [15:0] syn0_pair2;
-    wire [15:0] syn1_pair0;
-    wire [15:0] syn1_pair1;
-    wire [15:0] syn1_pair2;
-    wire [15:0] syn2_pair0;
-    wire [15:0] syn2_pair1;
-    wire [15:0] syn2_pair2;
-    wire [15:0] syn3_pair0;
-    wire [15:0] syn3_pair1;
-    wire [15:0] syn3_pair2;
-    wire [15:0] syn_vec0;
-    wire [15:0] syn_vec1;
-    wire [15:0] syn_vec2;
-    wire [15:0] syn_vec3;
-
-    assign syn0_pair0 = rotate_read16(hard1, 4'd14) ^ rotate_read16(hard2, 4'd10);
-    assign syn0_pair1 = rotate_read16(hard3, 4'd2 ) ^ rotate_read16(hard4, 4'd13);
-    assign syn0_pair2 = rotate_read16(hard5, 4'd12) ^ rotate_read16(hard6, 4'd9 );
-    assign syn_vec0 = (syn0_pair0 ^ syn0_pair1) ^
-                      (syn0_pair2 ^ rotate_read16(hard7, 4'd3));
-
-    assign syn1_pair0 = rotate_read16(hard0, 4'd5 ) ^ rotate_read16(hard2, 4'd14);
-    assign syn1_pair1 = rotate_read16(hard3, 4'd10) ^ rotate_read16(hard4, 4'd2 );
-    assign syn1_pair2 = rotate_read16(hard5, 4'd13) ^ rotate_read16(hard6, 4'd12);
-    assign syn_vec1 = (syn1_pair0 ^ syn1_pair1) ^
-                      (syn1_pair2 ^ rotate_read16(hard7, 4'd9));
-
-    assign syn2_pair0 = hard0 ^ rotate_read16(hard1, 4'd5);
-    assign syn2_pair1 = rotate_read16(hard3, 4'd14) ^ rotate_read16(hard4, 4'd10);
-    assign syn2_pair2 = rotate_read16(hard5, 4'd2 ) ^ rotate_read16(hard6, 4'd13);
-    assign syn_vec2 = (syn2_pair0 ^ syn2_pair1) ^
-                      (syn2_pair2 ^ rotate_read16(hard7, 4'd12));
-
-    assign syn3_pair0 = rotate_read16(hard0, 4'd7) ^ hard1;
-    assign syn3_pair1 = rotate_read16(hard2, 4'd5 ) ^ rotate_read16(hard4, 4'd14);
-    assign syn3_pair2 = rotate_read16(hard5, 4'd10) ^ rotate_read16(hard6, 4'd2 );
-    assign syn_vec3 = (syn3_pair0 ^ syn3_pair1) ^
-                      (syn3_pair2 ^ rotate_read16(hard7, 4'd13));
-
-    assign syndrome_nonzero = |(syn_vec0 | syn_vec1 | syn_vec2 | syn_vec3);
-
-    //============================================================
-    // Registered output
-    //============================================================
-
-    always @(posedge clk or negedge rst_n) begin : OUTPUT_CONTROL
+    reg warn_reg;
+    always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             out_valid <= 1'b0;
-            out_data <= 8'd0;
-            out_warn <= 1'b0;
-            output_idx <= 7'd0;
-            final_bank_sel <= 1'b0;
-            warn_reg <= 1'b0;
+            out_data  <= 8'd0;
+            out_warn  <= 1'b0;
+            warn_reg  <= 1'b0;
         end else if (stop_now) begin
-            final_bank_sel <= current_bank_sel;
-            warn_reg <= at_limit && syndrome_nonzero;
+            warn_reg  <= at_limit && syndrome_nonzero;
             out_valid <= 1'b1;
-            out_warn <= at_limit && syndrome_nonzero;
-            if (current_bank_sel)
-                out_data <= Ljb[0][0];
-            else
-                out_data <= Lja[0][0];
-            output_idx <= 7'd1;
-        end else if (state == S_OUTPUT) begin
+            out_warn  <= at_limit && syndrome_nonzero;
+            out_data  <= out_data_comb;
+        end else if (state == S_OUT) begin
             out_valid <= 1'b1;
-            out_warn <= warn_reg;
-            if (final_bank_sel)
-                out_data <= Ljb[output_idx[6:4]][output_idx[3:0]];
-            else
-                out_data <= Lja[output_idx[6:4]][output_idx[3:0]];
-
-            if (output_idx == 7'd127)
-                output_idx <= 7'd0;
-            else
-                output_idx <= output_idx + 7'd1;
+            out_warn  <= warn_reg;
+            out_data  <= out_data_comb;
         end else begin
             out_valid <= 1'b0;
-            out_data <= 8'd0;
-            out_warn <= 1'b0;
-            output_idx <= 7'd0;
+            out_data  <= 8'd0;
+            out_warn  <= 1'b0;
         end
     end
 
