@@ -1,134 +1,147 @@
-module cnu7_desc (
-    input      [41:0] q_flat,
-    output reg [19:0] desc_out,
-    output reg [41:0] r_flat
+module CNU_lane (
+    input  signed [5:0] q0,
+    input  signed [5:0] q1,
+    input  signed [5:0] q2,
+    input  signed [5:0] q3,
+    input  signed [5:0] q4,
+    input  signed [5:0] q5,
+    input  signed [5:0] q6,
+
+    output reg [19:0] c2v_new,
+    output reg [41:0] r_new_flat
 );
 
-    reg signed [5:0] q_value [0:6];
-    reg        [4:0] q_mag   [0:6];
-    reg        [6:0] q_neg;
-    reg        [6:0] r_neg;
-    reg              sign_parity;
-    reg        [12:0] leaf0;
-    reg        [12:0] leaf1;
-    reg        [12:0] leaf2;
-    reg        [12:0] leaf3;
-    reg        [12:0] leaf4;
-    reg        [12:0] leaf5;
-    reg        [12:0] leaf6;
-    reg        [12:0] pair01;
-    reg        [12:0] pair23;
-    reg        [12:0] pair45;
-    reg        [12:0] group03;
-    reg        [12:0] group46;
-    reg        [12:0] root_pair;
-    reg        [4:0] norm_a;
-    reg        [4:0] norm_b;
-    reg        [4:0] out_mag;
-    integer edge_no;
+    reg [12:0] leaf [0:6];
+    reg [12:0] pair01;
+    reg [12:0] pair23;
+    reg [12:0] pair45;
+    reg [12:0] group03;
+    reg [12:0] group46;
+    reg [12:0] root_pair;
 
-    function [12:0] merge_pair;
+    reg [4:0] mag0;
+    reg [4:0] mag1;
+    reg [4:0] mag2;
+    reg [4:0] mag3;
+    reg [4:0] mag4;
+    reg [4:0] mag5;
+    reg [4:0] mag6;
+    reg [6:0] q_neg;
+    reg [6:0] r_neg;
+    reg       sign_parity;
+    reg [4:0] norm_min1;
+    reg [4:0] norm_min2;
+
+    function [4:0] abs6;
+        input signed [5:0] value;
+        begin
+            if (value[5])
+                abs6 = (~value[4:0]) + 5'd1;
+            else
+                abs6 = value[4:0];
+        end
+    endfunction
+
+    function [12:0] merge_top2;
         input [12:0] left_value;
         input [12:0] right_value;
-        reg [4:0] left_min;
-        reg [4:0] left_second;
-        reg [2:0] left_index;
-        reg [4:0] right_min;
-        reg [4:0] right_second;
-        reg [2:0] right_index;
-        reg [4:0] next_second;
+        reg [4:0] next_min2;
         begin
-            left_min    = left_value[12:8];
-            left_index  = left_value[7:5];
-            left_second = left_value[4:0];
-            right_min    = right_value[12:8];
-            right_index  = right_value[7:5];
-            right_second = right_value[4:0];
-
-            if ((left_min < right_min) ||
-                ((left_min == right_min) && (left_index <= right_index))) begin
-                if (left_second < right_min)
-                    next_second = left_second;
+            // The tree always places lower edge indices in the left subtree.
+            // Selecting left on a tie therefore implements the required tie rule.
+            if (left_value[12:8] <= right_value[12:8]) begin
+                if (left_value[4:0] < right_value[12:8])
+                    next_min2 = left_value[4:0];
                 else
-                    next_second = right_min;
-                merge_pair = {left_min, left_index, next_second};
-            end
-            else begin
-                if (right_second < left_min)
-                    next_second = right_second;
+                    next_min2 = right_value[12:8];
+                merge_top2 = {left_value[12:5], next_min2};
+            end else begin
+                if (right_value[4:0] < left_value[12:8])
+                    next_min2 = right_value[4:0];
                 else
-                    next_second = left_min;
-                merge_pair = {right_min, right_index, next_second};
+                    next_min2 = left_value[12:8];
+                merge_top2 = {right_value[12:5], next_min2};
             end
         end
     endfunction
 
     function [4:0] norm5;
-        input [4:0] mag;
-        reg [1:0] rem_round;
+        input [4:0] magnitude;
+        reg [6:0] wide_value;
         begin
-            case (mag[1:0])
-                2'd0: rem_round = 2'd0;
-                2'd1: rem_round = 2'd1;
-                2'd2: rem_round = 2'd2;
-                default: rem_round = 2'd2;
-            endcase
-            norm5 = {2'b00, mag[4:2]} +
-                    {1'b0, mag[4:2], 1'b0} +
-                    {3'b000, rem_round};
+            wide_value = ({2'b00, magnitude} << 1)
+                       +  {2'b00, magnitude} + 7'd2;
+            norm5 = wide_value[6:2];
         end
     endfunction
 
-    always @* begin
-        q_neg = 7'd0;
-        r_neg = 7'd0;
-        r_flat = 42'd0;
-        desc_out = 20'd0;
-
-        for (edge_no = 0; edge_no < 7; edge_no = edge_no + 1) begin
-            q_value[edge_no] = q_flat[edge_no*6 +: 6];
-            q_neg[edge_no] = q_value[edge_no][5];
-            if (q_value[edge_no][5])
-                q_mag[edge_no] = (~q_value[edge_no][4:0]) + 5'd1;
+    function [5:0] make_r;
+        input [4:0] magnitude;
+        input       negative;
+        begin
+            if (magnitude == 5'd0)
+                make_r = 6'd0;
+            else if (negative)
+                make_r = (~{1'b0, magnitude}) + 6'd1;
             else
-                q_mag[edge_no] = q_value[edge_no][4:0];
+                make_r = {1'b0, magnitude};
         end
+    endfunction
 
-        leaf0 = {q_mag[0], 3'd0, 5'd31};
-        leaf1 = {q_mag[1], 3'd1, 5'd31};
-        leaf2 = {q_mag[2], 3'd2, 5'd31};
-        leaf3 = {q_mag[3], 3'd3, 5'd31};
-        leaf4 = {q_mag[4], 3'd4, 5'd31};
-        leaf5 = {q_mag[5], 3'd5, 5'd31};
-        leaf6 = {q_mag[6], 3'd6, 5'd31};
+    always @(*) begin
+        mag0 = abs6(q0);
+        mag1 = abs6(q1);
+        mag2 = abs6(q2);
+        mag3 = abs6(q3);
+        mag4 = abs6(q4);
+        mag5 = abs6(q5);
+        mag6 = abs6(q6);
 
-        pair01 = merge_pair(leaf0, leaf1);
-        pair23 = merge_pair(leaf2, leaf3);
-        pair45 = merge_pair(leaf4, leaf5);
-        group03 = merge_pair(pair01, pair23);
-        group46 = merge_pair(pair45, leaf6);
-        root_pair = merge_pair(group03, group46);
+        leaf[0] = {mag0, 3'd0, 5'd31};
+        leaf[1] = {mag1, 3'd1, 5'd31};
+        leaf[2] = {mag2, 3'd2, 5'd31};
+        leaf[3] = {mag3, 3'd3, 5'd31};
+        leaf[4] = {mag4, 3'd4, 5'd31};
+        leaf[5] = {mag5, 3'd5, 5'd31};
+        leaf[6] = {mag6, 3'd6, 5'd31};
 
-        norm_a = norm5(root_pair[12:8]);
-        norm_b = norm5(root_pair[4:0]);
+        pair01   = merge_top2(leaf[0], leaf[1]);
+        pair23   = merge_top2(leaf[2], leaf[3]);
+        pair45   = merge_top2(leaf[4], leaf[5]);
+        group03  = merge_top2(pair01, pair23);
+        group46  = merge_top2(pair45, leaf[6]);
+        root_pair = merge_top2(group03, group46);
+
+        norm_min1 = norm5(root_pair[12:8]);
+        norm_min2 = norm5(root_pair[4:0]);
+
+        q_neg = {q6[5], q5[5], q4[5], q3[5], q2[5], q1[5], q0[5]};
         sign_parity = ^q_neg;
+        r_neg = q_neg ^ {7{sign_parity}};
 
-        for (edge_no = 0; edge_no < 7; edge_no = edge_no + 1) begin
-            r_neg[edge_no] = sign_parity ^ q_neg[edge_no];
-            if (edge_no[2:0] == root_pair[7:5])
-                out_mag = norm_b;
-            else
-                out_mag = norm_a;
+        c2v_new = {norm_min1, norm_min2, root_pair[7:5], r_neg};
 
-            if (out_mag == 5'd0)
-                r_flat[edge_no*6 +: 6] = 6'd0;
-            else if (r_neg[edge_no])
-                r_flat[edge_no*6 +: 6] = (~{1'b0, out_mag}) + 6'd1;
-            else
-                r_flat[edge_no*6 +: 6] = {1'b0, out_mag};
-        end
-
-        desc_out = {norm_a, norm_b, root_pair[7:5], r_neg};
+        r_new_flat[5:0] = make_r(
+            (root_pair[7:5] == 3'd0) ? norm_min2 : norm_min1,
+            r_neg[0]);
+        r_new_flat[11:6] = make_r(
+            (root_pair[7:5] == 3'd1) ? norm_min2 : norm_min1,
+            r_neg[1]);
+        r_new_flat[17:12] = make_r(
+            (root_pair[7:5] == 3'd2) ? norm_min2 : norm_min1,
+            r_neg[2]);
+        r_new_flat[23:18] = make_r(
+            (root_pair[7:5] == 3'd3) ? norm_min2 : norm_min1,
+            r_neg[3]);
+        r_new_flat[29:24] = make_r(
+            (root_pair[7:5] == 3'd4) ? norm_min2 : norm_min1,
+            r_neg[4]);
+        r_new_flat[35:30] = make_r(
+            (root_pair[7:5] == 3'd5) ? norm_min2 : norm_min1,
+            r_neg[5]);
+        r_new_flat[41:36] = make_r(
+            (root_pair[7:5] == 3'd6) ? norm_min2 : norm_min1,
+            r_neg[6]);
     end
 
 endmodule
@@ -146,58 +159,66 @@ module LDPC (
     output reg         out_warn
 );
 
-    localparam [2:0] ST_IDLE   = 3'd0;
-    localparam [2:0] ST_LOAD   = 3'd1;
-    localparam [2:0] ST_RUN    = 3'd2;
-    localparam [2:0] ST_CHECK  = 3'd3;
-    localparam [2:0] ST_OUTPUT = 3'd4;
+    localparam [1:0] S_IDLE   = 2'd0;
+    localparam [1:0] S_READ   = 2'd1;
+    localparam [1:0] S_LDPC   = 2'd2;
+    localparam [1:0] S_OUTPUT = 2'd3;
 
-    localparam integer CNU_COUNT = 8;
-    localparam integer EDGE_COUNT = 56;
+    localparam integer CNU_COUNT  = 8;
+    localparam integer EDGE_COUNT = 7;
 
-    reg [2:0] state;
+    reg [1:0] state;
+    reg [1:0] next_state_c;
     reg       mode_reg;
-    reg [6:0] input_idx;
+
+    reg [6:0] read_idx;
     reg [6:0] output_idx;
-    reg [2:0] iter_idx;
-    reg [1:0] layer_cnt;
-    reg [1:0] batch_cnt;
-    reg       bank_sel;
-    reg       warn_reg;
+    reg [3:0] iteration_cnt;
+    reg [2:0] cnu8_cnt;
 
-    reg signed [7:0] p_mem0 [0:127];
-    reg signed [7:0] p_mem1 [0:127];
-    reg        [19:0] desc_mem [0:63];
+    wire [1:0] layer;
+    wire       batch;
+    assign layer = cnu8_cnt[2:1];
+    assign batch = cnu8_cnt[0];
 
-    reg  [CNU_COUNT*42-1:0] q_bus;
-    wire [CNU_COUNT*42-1:0] r_bus;
-    wire [CNU_COUNT*20-1:0] desc_bus;
-    reg  [CNU_COUNT*6-1:0]  cn_idx_bus;
-    reg  [EDGE_COUNT*7-1:0] vn_idx_bus;
-    reg  [EDGE_COUNT*8-1:0] q_base_bus;
-    reg  [EDGE_COUNT*8-1:0] acc_base_bus;
-    reg  [EDGE_COUNT*8-1:0] p_new_bus;
+    reg signed [7:0] Lja [0:7][0:15];
+    reg signed [7:0] Ljb [0:7][0:15];
+    reg       [19:0] c2v [0:3][0:1][0:7];
 
-    reg [63:0] syn_bits;
-    reg [6:0] syn_inputs;
-    reg       syn_nonzero;
+    reg        [15:0] pair_vector [0:6][0:7];
+    reg signed  [7:0] src_vector  [0:6][0:7];
+    reg signed  [7:0] dst_vector  [0:6][0:7];
 
-    wire [1:0] phase_layer;
-    wire [1:0] phase_batch;
-    wire       zero_old;
-    wire       at_limit;
-    wire       advance_iter;
-    wire       batch_commit;
-    wire       phase_active;
+    wire syndrome_nonzero;
+    wire check_cycle;
+    wire at_limit;
+    wire continue_iter;
+    wire stop_now;
+    wire ldpc_commit;
+    wire zero_old;
+    wire current_bank_sel;
+    wire late_input_write;
 
-    assign phase_layer = (state == ST_CHECK) ? 2'd0 : layer_cnt;
-    assign phase_batch = (state == ST_CHECK) ? 2'd0 : batch_cnt;
-    assign zero_old = (state == ST_RUN) && (iter_idx == 3'd0);
-    assign at_limit = (iter_idx == 3'd7);
-    assign advance_iter = syn_nonzero && !at_limit;
-    assign batch_commit = (state == ST_RUN) ||
-                          ((state == ST_CHECK) && advance_iter);
-    assign phase_active = (state == ST_RUN) || (state == ST_CHECK);
+    reg final_bank_sel;
+    reg warn_reg;
+
+    assign check_cycle = (state == S_LDPC) &&
+                         (cnu8_cnt == 3'd0) &&
+                         (iteration_cnt != 4'd0);
+    assign at_limit = (iteration_cnt == 4'd8);
+    assign continue_iter = check_cycle && syndrome_nonzero && !at_limit;
+    assign stop_now = check_cycle && (!syndrome_nonzero || at_limit);
+    assign ldpc_commit = (state == S_LDPC) &&(!check_cycle || continue_iter);
+    assign zero_old = (state == S_LDPC) && (iteration_cnt == 4'd0);
+
+    // Mode 0 uses iteration-level ping-pong. Mode 1 always uses Lja.
+    assign current_bank_sel = mode_reg ? 1'b0 : iteration_cnt[0];
+
+    // Input[127] is accepted while iteration 1, layer 0, batch 0 is computed.
+    assign late_input_write = (state == S_LDPC) &&
+                              (iteration_cnt == 4'd0) &&
+                              (cnu8_cnt == 3'd0) &&
+                              in_data_valid && (read_idx == 7'd127);
 
     function [5:0] clip6;
         input signed [7:0] value;
@@ -211,413 +232,605 @@ module LDPC (
         end
     endfunction
 
-    function [2:0] edge_column;
-        input [1:0] layer_value;
-        input [2:0] edge_value;
+    function [15:0] rotate_read16;
+        input [15:0] value;
+        input [3:0]  shift;
+        reg [31:0] doubled;
         begin
-            if (edge_value < {1'b0, layer_value})
-                edge_column = edge_value;
-            else
-                edge_column = edge_value + 3'd1;
+            doubled = {value, value};
+            rotate_read16 = doubled >> shift;
         end
     endfunction
 
-    function [3:0] shift_value;
-        input [1:0] layer_value;
-        input [2:0] column_value;
-        begin
-            shift_value = 4'd0;
-            case (layer_value)
-                2'd0: begin
-                    case (column_value)
-                        3'd1: shift_value = 4'd14;
-                        3'd2: shift_value = 4'd10;
-                        3'd3: shift_value = 4'd2;
-                        3'd4: shift_value = 4'd13;
-                        3'd5: shift_value = 4'd12;
-                        3'd6: shift_value = 4'd9;
-                        3'd7: shift_value = 4'd3;
-                        default: shift_value = 4'd0;
-                    endcase
-                end
-                2'd1: begin
-                    case (column_value)
-                        3'd0: shift_value = 4'd5;
-                        3'd2: shift_value = 4'd14;
-                        3'd3: shift_value = 4'd10;
-                        3'd4: shift_value = 4'd2;
-                        3'd5: shift_value = 4'd13;
-                        3'd6: shift_value = 4'd12;
-                        3'd7: shift_value = 4'd9;
-                        default: shift_value = 4'd0;
-                    endcase
-                end
-                2'd2: begin
-                    case (column_value)
-                        3'd0: shift_value = 4'd0;
-                        3'd1: shift_value = 4'd5;
-                        3'd3: shift_value = 4'd14;
-                        3'd4: shift_value = 4'd10;
-                        3'd5: shift_value = 4'd2;
-                        3'd6: shift_value = 4'd13;
-                        3'd7: shift_value = 4'd12;
-                        default: shift_value = 4'd0;
-                    endcase
-                end
-                2'd3: begin
-                    case (column_value)
-                        3'd0: shift_value = 4'd7;
-                        3'd1: shift_value = 4'd0;
-                        3'd2: shift_value = 4'd5;
-                        3'd4: shift_value = 4'd14;
-                        3'd5: shift_value = 4'd10;
-                        3'd6: shift_value = 4'd2;
-                        3'd7: shift_value = 4'd13;
-                        default: shift_value = 4'd0;
-                    endcase
-                end
-                default: shift_value = 4'd0;
-            endcase
-        end
-    endfunction
+    //============================================================
+    // Fixed QC-H gather routing
+    //============================================================
 
-    genvar gen_lane;
+    integer route_lane_i;
+    integer route_edge_i;
+    always @(*) begin : PAIR_VECTOR
+        for (route_edge_i = 0; route_edge_i < EDGE_COUNT;
+             route_edge_i = route_edge_i + 1) begin
+            for (route_lane_i = 0; route_lane_i < CNU_COUNT;
+                 route_lane_i = route_lane_i + 1) begin
+                pair_vector[route_edge_i][route_lane_i] = 16'd0;
+            end
+        end
+
+        case (layer)
+            2'd0: begin
+                for (route_lane_i = 0; route_lane_i < CNU_COUNT;
+                     route_lane_i = route_lane_i + 1) begin
+                    pair_vector[0][route_lane_i] = batch ?
+                        {Ljb[1][(route_lane_i+6 )&15], Lja[1][(route_lane_i+6 )&15]} :
+                        {Ljb[1][(route_lane_i+14)&15], Lja[1][(route_lane_i+14)&15]};
+                    pair_vector[1][route_lane_i] = batch ?
+                        {Ljb[2][(route_lane_i+2 )&15], Lja[2][(route_lane_i+2 )&15]} :
+                        {Ljb[2][(route_lane_i+10)&15], Lja[2][(route_lane_i+10)&15]};
+                    pair_vector[2][route_lane_i] = batch ?
+                        {Ljb[3][(route_lane_i+10)&15], Lja[3][(route_lane_i+10)&15]} :
+                        {Ljb[3][(route_lane_i+2 )&15], Lja[3][(route_lane_i+2 )&15]};
+                    pair_vector[3][route_lane_i] = batch ?
+                        {Ljb[4][(route_lane_i+5 )&15], Lja[4][(route_lane_i+5 )&15]} :
+                        {Ljb[4][(route_lane_i+13)&15], Lja[4][(route_lane_i+13)&15]};
+                    pair_vector[4][route_lane_i] = batch ?
+                        {Ljb[5][(route_lane_i+4 )&15], Lja[5][(route_lane_i+4 )&15]} :
+                        {Ljb[5][(route_lane_i+12)&15], Lja[5][(route_lane_i+12)&15]};
+                    pair_vector[5][route_lane_i] = batch ?
+                        {Ljb[6][(route_lane_i+1 )&15], Lja[6][(route_lane_i+1 )&15]} :
+                        {Ljb[6][(route_lane_i+9 )&15], Lja[6][(route_lane_i+9 )&15]};
+                    pair_vector[6][route_lane_i] = batch ?
+                        {Ljb[7][(route_lane_i+11)&15], Lja[7][(route_lane_i+11)&15]} :
+                        {Ljb[7][(route_lane_i+3 )&15], Lja[7][(route_lane_i+3 )&15]};
+                end
+            end
+
+            2'd1: begin
+                for (route_lane_i = 0; route_lane_i < CNU_COUNT;
+                     route_lane_i = route_lane_i + 1) begin
+                    pair_vector[0][route_lane_i] = batch ?
+                        {Ljb[0][(route_lane_i+13)&15], Lja[0][(route_lane_i+13)&15]} :
+                        {Ljb[0][(route_lane_i+5 )&15], Lja[0][(route_lane_i+5 )&15]};
+                    pair_vector[1][route_lane_i] = batch ?
+                        {Ljb[2][(route_lane_i+6 )&15], Lja[2][(route_lane_i+6 )&15]} :
+                        {Ljb[2][(route_lane_i+14)&15], Lja[2][(route_lane_i+14)&15]};
+                    pair_vector[2][route_lane_i] = batch ?
+                        {Ljb[3][(route_lane_i+2 )&15], Lja[3][(route_lane_i+2 )&15]} :
+                        {Ljb[3][(route_lane_i+10)&15], Lja[3][(route_lane_i+10)&15]};
+                    pair_vector[3][route_lane_i] = batch ?
+                        {Ljb[4][(route_lane_i+10)&15], Lja[4][(route_lane_i+10)&15]} :
+                        {Ljb[4][(route_lane_i+2 )&15], Lja[4][(route_lane_i+2 )&15]};
+                    pair_vector[4][route_lane_i] = batch ?
+                        {Ljb[5][(route_lane_i+5 )&15], Lja[5][(route_lane_i+5 )&15]} :
+                        {Ljb[5][(route_lane_i+13)&15], Lja[5][(route_lane_i+13)&15]};
+                    pair_vector[5][route_lane_i] = batch ?
+                        {Ljb[6][(route_lane_i+4 )&15], Lja[6][(route_lane_i+4 )&15]} :
+                        {Ljb[6][(route_lane_i+12)&15], Lja[6][(route_lane_i+12)&15]};
+                    pair_vector[6][route_lane_i] = batch ?
+                        {Ljb[7][(route_lane_i+1 )&15], Lja[7][(route_lane_i+1 )&15]} :
+                        {Ljb[7][(route_lane_i+9 )&15], Lja[7][(route_lane_i+9 )&15]};
+                end
+            end
+
+            2'd2: begin
+                for (route_lane_i = 0; route_lane_i < CNU_COUNT;
+                     route_lane_i = route_lane_i + 1) begin
+                    pair_vector[0][route_lane_i] = batch ?
+                        {Ljb[0][(route_lane_i+8)&15], Lja[0][(route_lane_i+8)&15]} :
+                        {Ljb[0][route_lane_i],        Lja[0][route_lane_i]};
+                    pair_vector[1][route_lane_i] = batch ?
+                        {Ljb[1][(route_lane_i+13)&15], Lja[1][(route_lane_i+13)&15]} :
+                        {Ljb[1][(route_lane_i+5 )&15], Lja[1][(route_lane_i+5 )&15]};
+                    pair_vector[2][route_lane_i] = batch ?
+                        {Ljb[3][(route_lane_i+6 )&15], Lja[3][(route_lane_i+6 )&15]} :
+                        {Ljb[3][(route_lane_i+14)&15], Lja[3][(route_lane_i+14)&15]};
+                    pair_vector[3][route_lane_i] = batch ?
+                        {Ljb[4][(route_lane_i+2 )&15], Lja[4][(route_lane_i+2 )&15]} :
+                        {Ljb[4][(route_lane_i+10)&15], Lja[4][(route_lane_i+10)&15]};
+                    pair_vector[4][route_lane_i] = batch ?
+                        {Ljb[5][(route_lane_i+10)&15], Lja[5][(route_lane_i+10)&15]} :
+                        {Ljb[5][(route_lane_i+2 )&15], Lja[5][(route_lane_i+2 )&15]};
+                    pair_vector[5][route_lane_i] = batch ?
+                        {Ljb[6][(route_lane_i+5 )&15], Lja[6][(route_lane_i+5 )&15]} :
+                        {Ljb[6][(route_lane_i+13)&15], Lja[6][(route_lane_i+13)&15]};
+                    pair_vector[6][route_lane_i] = batch ?
+                        {Ljb[7][(route_lane_i+4 )&15], Lja[7][(route_lane_i+4 )&15]} :
+                        {Ljb[7][(route_lane_i+12)&15], Lja[7][(route_lane_i+12)&15]};
+                end
+            end
+
+            2'd3: begin
+                for (route_lane_i = 0; route_lane_i < CNU_COUNT;
+                     route_lane_i = route_lane_i + 1) begin
+                    pair_vector[0][route_lane_i] = batch ?
+                        {Ljb[0][(route_lane_i+15)&15], Lja[0][(route_lane_i+15)&15]} :
+                        {Ljb[0][(route_lane_i+7 )&15], Lja[0][(route_lane_i+7 )&15]};
+                    pair_vector[1][route_lane_i] = batch ?
+                        {Ljb[1][(route_lane_i+8)&15], Lja[1][(route_lane_i+8)&15]} :
+                        {Ljb[1][route_lane_i],       Lja[1][route_lane_i]};
+                    pair_vector[2][route_lane_i] = batch ?
+                        {Ljb[2][(route_lane_i+13)&15], Lja[2][(route_lane_i+13)&15]} :
+                        {Ljb[2][(route_lane_i+5 )&15], Lja[2][(route_lane_i+5 )&15]};
+                    pair_vector[3][route_lane_i] = batch ?
+                        {Ljb[4][(route_lane_i+6 )&15], Lja[4][(route_lane_i+6 )&15]} :
+                        {Ljb[4][(route_lane_i+14)&15], Lja[4][(route_lane_i+14)&15]};
+                    pair_vector[4][route_lane_i] = batch ?
+                        {Ljb[5][(route_lane_i+2 )&15], Lja[5][(route_lane_i+2 )&15]} :
+                        {Ljb[5][(route_lane_i+10)&15], Lja[5][(route_lane_i+10)&15]};
+                    pair_vector[5][route_lane_i] = batch ?
+                        {Ljb[6][(route_lane_i+10)&15], Lja[6][(route_lane_i+10)&15]} :
+                        {Ljb[6][(route_lane_i+2 )&15], Lja[6][(route_lane_i+2 )&15]};
+                    pair_vector[6][route_lane_i] = batch ?
+                        {Ljb[7][(route_lane_i+5 )&15], Lja[7][(route_lane_i+5 )&15]} :
+                        {Ljb[7][(route_lane_i+13)&15], Lja[7][(route_lane_i+13)&15]};
+                end
+            end
+
+            default: begin
+            end
+        endcase
+    end
+
+    integer src_dst_edge_i;
+    integer src_dst_lane_i;
+    always @(*) begin : SRC_DST_ROUTING
+        for (src_dst_edge_i = 0; src_dst_edge_i < EDGE_COUNT;
+             src_dst_edge_i = src_dst_edge_i + 1) begin
+            for (src_dst_lane_i = 0; src_dst_lane_i < CNU_COUNT;
+                 src_dst_lane_i = src_dst_lane_i + 1) begin
+                if (current_bank_sel == 1'b0) begin
+                    src_vector[src_dst_edge_i][src_dst_lane_i] =
+                        $signed(pair_vector[src_dst_edge_i][src_dst_lane_i][7:0]);
+                    dst_vector[src_dst_edge_i][src_dst_lane_i] =
+                        $signed(pair_vector[src_dst_edge_i][src_dst_lane_i][15:8]);
+                end else begin
+                    src_vector[src_dst_edge_i][src_dst_lane_i] =
+                        $signed(pair_vector[src_dst_edge_i][src_dst_lane_i][15:8]);
+                    dst_vector[src_dst_edge_i][src_dst_lane_i] =
+                        $signed(pair_vector[src_dst_edge_i][src_dst_lane_i][7:0]);
+                end
+            end
+        end
+    end
+
+    //============================================================
+    // FSM and frame control
+    //============================================================
+
+    always @(*) begin : STATE_NEXT
+        next_state_c = state;
+        case (state)
+            S_IDLE: begin
+                if (in_mode_valid && !out_valid)
+                    next_state_c = S_READ;
+            end
+            S_READ: begin
+                if (in_data_valid && (read_idx == 7'd126))
+                    next_state_c = S_LDPC;
+            end
+            S_LDPC: begin
+                if (stop_now)
+                    next_state_c = S_OUTPUT;
+            end
+            S_OUTPUT: begin
+                if (output_idx == 7'd127)
+                    next_state_c = S_IDLE;
+            end
+            default: begin
+                next_state_c = S_IDLE;
+            end
+        endcase
+    end
+
+    always @(posedge clk or negedge rst_n) begin : FSM_STATE
+        if (!rst_n)
+            state <= S_IDLE;
+        else
+            state <= next_state_c;
+    end
+
+    always @(posedge clk or negedge rst_n) begin : MODE_CONTROL
+        if (!rst_n)
+            mode_reg <= 1'b0;
+        else if (in_mode_valid && (state == S_IDLE) && !out_valid)
+            mode_reg <= in_mode;
+    end
+
+    always @(posedge clk or negedge rst_n) begin : READ_INDEX
+        if (!rst_n) begin
+            read_idx <= 7'd0;
+        end else if (in_mode_valid && (state == S_IDLE) && !out_valid) begin
+            read_idx <= 7'd0;
+        end else if ((state == S_READ) && in_data_valid) begin
+            read_idx <= read_idx + 7'd1;
+        end else if (late_input_write) begin
+            read_idx <= 7'd0;
+        end
+    end
+
+    always @(posedge clk or negedge rst_n) begin : LDPC_COUNTER
+        if (!rst_n) begin
+            iteration_cnt <= 4'd0;
+            cnu8_cnt <= 3'd0;
+        end else if (in_mode_valid && (state == S_IDLE) && !out_valid) begin
+            iteration_cnt <= 4'd0;
+            cnu8_cnt <= 3'd0;
+        end else if (state == S_LDPC) begin
+            if (stop_now) begin
+                cnu8_cnt <= 3'd0;
+            end else if (ldpc_commit) begin
+                if (cnu8_cnt == 3'd7) begin
+                    cnu8_cnt <= 3'd0;
+                    iteration_cnt <= iteration_cnt + 4'd1;
+                end else begin
+                    cnu8_cnt <= cnu8_cnt + 3'd1;
+                end
+            end
+        end
+    end
+
+    //============================================================
+    // Old C2V reconstruction and edge arithmetic
+    //============================================================
+
+    reg signed [5:0] r_old       [0:7][0:6];
+    reg        [4:0] min1_old    [0:7];
+    reg        [4:0] min2_old    [0:7];
+    reg        [2:0] min1_idx    [0:7];
+    reg        [6:0] c2v_neg     [0:7];
+    reg        [4:0] r_old_mag   [0:7][0:6];
+    reg signed [7:0] r_old_ext   [0:7][0:6];
+    reg signed [7:0] q_base      [0:7][0:6];
+    reg signed [7:0] dst_base    [0:7][0:6];
+    reg signed [5:0] q_msg       [0:7][0:6];
+    reg signed [7:0] update_base [0:7][0:6];
+
+    reg [6:0] first_touch_edge;
+    always @(*) begin : FIRST_TOUCH
+        case (layer)
+            2'd0: first_touch_edge = 7'b1111111;
+            2'd1: first_touch_edge = 7'b0000001;
+            default: first_touch_edge = 7'b0000000;
+        endcase
+    end
+
+    integer cnu_i;
+    integer edge_i;
+    always @(*) begin : CNU_INPUT
+        for (cnu_i = 0; cnu_i < CNU_COUNT; cnu_i = cnu_i + 1) begin
+            min1_old[cnu_i] = 5'd0;
+            min2_old[cnu_i] = 5'd0;
+            min1_idx[cnu_i] = 3'd0;
+            c2v_neg[cnu_i]  = 7'd0;
+            for (edge_i = 0; edge_i < EDGE_COUNT; edge_i = edge_i + 1) begin
+                r_old_mag[cnu_i][edge_i] = 5'd0;
+                r_old[cnu_i][edge_i] = 6'sd0;
+                r_old_ext[cnu_i][edge_i] = 8'sd0;
+                q_base[cnu_i][edge_i] = 8'sd0;
+                dst_base[cnu_i][edge_i] = 8'sd0;
+                q_msg[cnu_i][edge_i] = 6'sd0;
+                update_base[cnu_i][edge_i] = 8'sd0;
+            end
+        end
+
+        if (state == S_LDPC) begin
+            for (cnu_i = 0; cnu_i < CNU_COUNT; cnu_i = cnu_i + 1) begin
+                if (!zero_old) begin
+                    min1_old[cnu_i] = c2v[layer][batch][cnu_i][19:15];
+                    min2_old[cnu_i] = c2v[layer][batch][cnu_i][14:10];
+                    min1_idx[cnu_i] = c2v[layer][batch][cnu_i][9:7];
+                    c2v_neg[cnu_i]  = c2v[layer][batch][cnu_i][6:0];
+                end
+
+                for (edge_i = 0; edge_i < EDGE_COUNT; edge_i = edge_i + 1) begin
+                    if (zero_old) begin
+                        r_old_mag[cnu_i][edge_i] = 5'd0;
+                        r_old[cnu_i][edge_i] = 6'sd0;
+                    end else begin
+                        if (min1_idx[cnu_i] == edge_i)
+                            r_old_mag[cnu_i][edge_i] = min2_old[cnu_i];
+                        else
+                            r_old_mag[cnu_i][edge_i] = min1_old[cnu_i];
+
+                        if (c2v_neg[cnu_i][edge_i])
+                            r_old[cnu_i][edge_i] =
+                                -$signed({1'b0, r_old_mag[cnu_i][edge_i]});
+                        else
+                            r_old[cnu_i][edge_i] =
+                                 $signed({1'b0, r_old_mag[cnu_i][edge_i]});
+                    end
+
+                    r_old_ext[cnu_i][edge_i] =
+                        {{2{r_old[cnu_i][edge_i][5]}}, r_old[cnu_i][edge_i]};
+                    q_base[cnu_i][edge_i] =
+                        src_vector[edge_i][cnu_i] - r_old_ext[cnu_i][edge_i];
+                    dst_base[cnu_i][edge_i] =
+                        dst_vector[edge_i][cnu_i] - r_old_ext[cnu_i][edge_i];
+                    q_msg[cnu_i][edge_i] = clip6(q_base[cnu_i][edge_i]);
+
+                    if (mode_reg || first_touch_edge[edge_i])
+                        update_base[cnu_i][edge_i] = q_base[cnu_i][edge_i];
+                    else
+                        update_base[cnu_i][edge_i] = dst_base[cnu_i][edge_i];
+                end
+            end
+        end
+    end
+
+    wire        [19:0] c2v_new_lane    [0:7];
+    wire        [41:0] r_new_flat_lane [0:7];
+    wire signed  [5:0] r_new            [0:7][0:6];
+    wire signed  [7:0] r_new_ext        [0:7][0:6];
+    wire signed  [7:0] new_lj           [0:7][0:6];
+
+    genvar cnu_g;
+    genvar edge_g;
     generate
-        for (gen_lane = 0; gen_lane < CNU_COUNT; gen_lane = gen_lane + 1) begin : GEN_CNU
-            cnu7_desc u_cnu7_desc (
-                .q_flat  (q_bus[gen_lane*42 +: 42]),
-                .desc_out(desc_bus[gen_lane*20 +: 20]),
-                .r_flat  (r_bus[gen_lane*42 +: 42])
+        for (cnu_g = 0; cnu_g < CNU_COUNT; cnu_g = cnu_g + 1) begin : GEN_CNU
+            CNU_lane u_CNU_lane (
+                .q0(q_msg[cnu_g][0]),
+                .q1(q_msg[cnu_g][1]),
+                .q2(q_msg[cnu_g][2]),
+                .q3(q_msg[cnu_g][3]),
+                .q4(q_msg[cnu_g][4]),
+                .q5(q_msg[cnu_g][5]),
+                .q6(q_msg[cnu_g][6]),
+                .c2v_new(c2v_new_lane[cnu_g]),
+                .r_new_flat(r_new_flat_lane[cnu_g])
             );
+
+            for (edge_g = 0; edge_g < EDGE_COUNT; edge_g = edge_g + 1) begin : GEN_NEW_LJ
+                assign r_new[cnu_g][edge_g] =
+                    r_new_flat_lane[cnu_g][edge_g*6 +: 6];
+                assign r_new_ext[cnu_g][edge_g] =
+                    {{2{r_new[cnu_g][edge_g][5]}}, r_new[cnu_g][edge_g]};
+                assign new_lj[cnu_g][edge_g] =
+                    $signed(update_base[cnu_g][edge_g]) +
+                    $signed(r_new_ext[cnu_g][edge_g]);
+            end
         end
     endgenerate
 
-    integer lane_no;
-    integer route_edge;
-    reg [4:0] route_row;
-    reg [5:0] route_cn;
-    reg [2:0] route_col;
-    reg [3:0] route_shift;
-    reg [3:0] route_x;
-    reg [6:0] route_vn;
-    reg [19:0] route_desc;
-    reg [4:0] old_mag;
-    reg signed [5:0] old_r;
-    reg signed [7:0] old_r_ext;
-    reg signed [7:0] source_value;
-    reg signed [7:0] accum_value;
-    reg signed [7:0] q_base_value;
-    reg signed [7:0] acc_base_value;
+    //============================================================
+    // Posterior and descriptor writeback
+    //============================================================
 
-    always @* begin
-        q_bus = {(CNU_COUNT*42){1'b0}};
-        cn_idx_bus = {(CNU_COUNT*6){1'b0}};
-        vn_idx_bus = {(EDGE_COUNT*7){1'b0}};
-        q_base_bus = {(EDGE_COUNT*8){1'b0}};
-        acc_base_bus = {(EDGE_COUNT*8){1'b0}};
-
-        route_row = 5'd0;
-        route_cn = 6'd0;
-        route_col = 3'd0;
-        route_shift = 4'd0;
-        route_x = 4'd0;
-        route_vn = 7'd0;
-        route_desc = 20'd0;
-        old_mag = 5'd0;
-        old_r = 6'sd0;
-        old_r_ext = 8'sd0;
-        source_value = 8'sd0;
-        accum_value = 8'sd0;
-        q_base_value = 8'sd0;
-        acc_base_value = 8'sd0;
-
-        if (phase_active) begin
-            for (lane_no = 0; lane_no < CNU_COUNT; lane_no = lane_no + 1) begin
-                route_row = {phase_batch, 3'b000} + lane_no[4:0];
-                route_cn = {phase_layer, 4'b0000} + route_row;
-                cn_idx_bus[lane_no*6 +: 6] = route_cn;
-
-                if (zero_old)
-                    route_desc = 20'd0;
-                else
-                    route_desc = desc_mem[route_cn];
-
-                for (route_edge = 0; route_edge < 7; route_edge = route_edge + 1) begin
-                    route_col = edge_column(phase_layer, route_edge[2:0]);
-                    route_shift = shift_value(phase_layer, route_col);
-                    route_x = route_row[3:0] + route_shift;
-                    route_vn = {route_col, 4'b0000} + {3'b000, route_x};
-                    vn_idx_bus[(lane_no*7+route_edge)*7 +: 7] = route_vn;
-
-                    if (route_edge[2:0] == route_desc[9:7])
-                        old_mag = route_desc[14:10];
-                    else
-                        old_mag = route_desc[19:15];
-
-                    if (zero_old || (old_mag == 5'd0))
-                        old_r = 6'sd0;
-                    else if (route_desc[route_edge])
-                        old_r = (~{1'b0, old_mag}) + 6'd1;
-                    else
-                        old_r = {1'b0, old_mag};
-
-                    old_r_ext = {{2{old_r[5]}}, old_r};
-
-                    if (mode_reg)
-                        source_value = p_mem0[route_vn];
-                    else if (bank_sel)
-                        source_value = p_mem1[route_vn];
-                    else
-                        source_value = p_mem0[route_vn];
-
-                    if (mode_reg)
-                        accum_value = source_value;
-                    else if (((route_col == 3'd0) && (phase_layer == 2'd1)) ||
-                             ((route_col != 3'd0) && (phase_layer == 2'd0)))
-                        accum_value = source_value;
-                    else if (bank_sel)
-                        accum_value = p_mem0[route_vn];
-                    else
-                        accum_value = p_mem1[route_vn];
-
-                    q_base_value = source_value - old_r_ext;
-                    acc_base_value = accum_value - old_r_ext;
-                    q_bus[(lane_no*42+route_edge*6) +: 6] = clip6(q_base_value);
-                    q_base_bus[(lane_no*56+route_edge*8) +: 8] = q_base_value;
-                    acc_base_bus[(lane_no*56+route_edge*8) +: 8] = acc_base_value;
-                end
-            end
+    integer lj_i;
+    always @(posedge clk) begin : POSTERIOR_WRITEBACK
+        if ((state == S_READ) && in_data_valid) begin
+            Lja[read_idx[6:4]][read_idx[3:0]] <=
+                {{2{in_data[5]}}, in_data};
         end
-    end
 
-    integer post_lane;
-    integer post_edge;
-    reg signed [5:0] post_r;
-    reg signed [7:0] post_r_ext;
-    reg signed [7:0] post_q_base;
-    reg signed [7:0] post_acc_base;
-    reg signed [7:0] post_update_base;
-    reg signed [7:0] post_value;
-
-    always @* begin
-        p_new_bus = {(EDGE_COUNT*8){1'b0}};
-        post_r = 6'sd0;
-        post_r_ext = 8'sd0;
-        post_q_base = 8'sd0;
-        post_acc_base = 8'sd0;
-        post_update_base = 8'sd0;
-        post_value = 8'sd0;
-
-        for (post_lane = 0; post_lane < CNU_COUNT; post_lane = post_lane + 1) begin
-            for (post_edge = 0; post_edge < 7; post_edge = post_edge + 1) begin
-                post_r = r_bus[(post_lane*42+post_edge*6) +: 6];
-                post_r_ext = {{2{post_r[5]}}, post_r};
-                post_q_base = q_base_bus[(post_lane*56+post_edge*8) +: 8];
-                post_acc_base = acc_base_bus[(post_lane*56+post_edge*8) +: 8];
-                if (mode_reg)
-                    post_update_base = post_q_base;
-                else
-                    post_update_base = post_acc_base;
-                post_value = post_update_base + post_r_ext;
-                p_new_bus[(post_lane*56+post_edge*8) +: 8] = post_value;
-            end
-        end
-    end
-
-    integer syn_layer;
-    integer syn_row;
-    integer syn_edge;
-    reg [2:0] syn_col;
-    reg [3:0] syn_shift;
-    reg [3:0] syn_x;
-    reg [6:0] syn_vn;
-
-    always @* begin
-        syn_bits = 64'd0;
-        syn_inputs = 7'd0;
-        syn_col = 3'd0;
-        syn_shift = 4'd0;
-        syn_x = 4'd0;
-        syn_vn = 7'd0;
-
-        for (syn_layer = 0; syn_layer < 4; syn_layer = syn_layer + 1) begin
-            for (syn_row = 0; syn_row < 16; syn_row = syn_row + 1) begin
-                for (syn_edge = 0; syn_edge < 7; syn_edge = syn_edge + 1) begin
-                    syn_col = edge_column(syn_layer[1:0], syn_edge[2:0]);
-                    syn_shift = shift_value(syn_layer[1:0], syn_col);
-                    syn_x = syn_row[3:0] + syn_shift;
-                    syn_vn = {syn_col, 4'b0000} + {3'b000, syn_x};
-                    if (mode_reg)
-                        syn_inputs[syn_edge] = p_mem0[syn_vn][7];
-                    else if (bank_sel)
-                        syn_inputs[syn_edge] = p_mem1[syn_vn][7];
-                    else
-                        syn_inputs[syn_edge] = p_mem0[syn_vn][7];
-                end
-                syn_bits[syn_layer*16+syn_row] =
-                    (syn_inputs[0] ^ syn_inputs[1]) ^
-                    (syn_inputs[2] ^ syn_inputs[3]) ^
-                    (syn_inputs[4] ^ syn_inputs[5]) ^ syn_inputs[6];
-            end
-        end
-        syn_nonzero = |syn_bits;
-    end
-
-    integer write_lane;
-    integer write_edge;
-
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            state      <= ST_IDLE;
-            mode_reg   <= 1'b0;
-            input_idx  <= 7'd0;
-            output_idx <= 7'd0;
-            iter_idx   <= 3'd0;
-            layer_cnt  <= 2'd0;
-            batch_cnt  <= 2'd0;
-            bank_sel   <= 1'b0;
-            warn_reg   <= 1'b0;
-            out_valid  <= 1'b0;
-            out_data   <= 8'd0;
-            out_warn   <= 1'b0;
-        end
-        else begin
-            if (batch_commit) begin
-                for (write_lane = 0; write_lane < CNU_COUNT; write_lane = write_lane + 1) begin
-                    desc_mem[cn_idx_bus[write_lane*6 +: 6]] <=
-                        desc_bus[write_lane*20 +: 20];
-                    for (write_edge = 0; write_edge < 7; write_edge = write_edge + 1) begin
-                        if (mode_reg)
-                            p_mem0[vn_idx_bus[(write_lane*7+write_edge)*7 +: 7]] <=
-                                p_new_bus[(write_lane*56+write_edge*8) +: 8];
-                        else if (bank_sel)
-                            p_mem0[vn_idx_bus[(write_lane*7+write_edge)*7 +: 7]] <=
-                                p_new_bus[(write_lane*56+write_edge*8) +: 8];
-                        else
-                            p_mem1[vn_idx_bus[(write_lane*7+write_edge)*7 +: 7]] <=
-                                p_new_bus[(write_lane*56+write_edge*8) +: 8];
-                    end
-                end
-            end
-
-            case (state)
-                ST_IDLE: begin
-                    out_valid <= 1'b0;
-                    out_data <= 8'd0;
-                    out_warn <= 1'b0;
-                    warn_reg <= 1'b0;
-                    if (in_mode_valid) begin
-                        mode_reg <= in_mode;
-                        input_idx <= 7'd0;
-                        output_idx <= 7'd0;
-                        iter_idx <= 3'd0;
-                        layer_cnt <= 2'd0;
-                        batch_cnt <= 2'd0;
-                        bank_sel <= 1'b0;
-                        state <= ST_LOAD;
-                    end
-                end
-
-                ST_LOAD: begin
-                    out_valid <= 1'b0;
-                    out_data <= 8'd0;
-                    out_warn <= 1'b0;
-                    if (in_data_valid) begin
-                        p_mem0[input_idx] <= {{2{in_data[5]}}, in_data};
-                        if (input_idx == 7'd127) begin
-                            input_idx <= 7'd0;
-                            iter_idx <= 3'd0;
-                            layer_cnt <= 2'd0;
-                            batch_cnt <= 2'd0;
-                            bank_sel <= 1'b0;
-                            state <= ST_RUN;
-                        end
-                        else begin
-                            input_idx <= input_idx + 7'd1;
+        if (ldpc_commit) begin
+            case (layer)
+                2'd0: begin
+                    for (lj_i = 0; lj_i < CNU_COUNT; lj_i = lj_i + 1) begin
+                        if (mode_reg || current_bank_sel) begin
+                            Lja[1][batch ? ((lj_i+6 )&15) : ((lj_i+14)&15)] <= new_lj[lj_i][0];
+                            Lja[2][batch ? ((lj_i+2 )&15) : ((lj_i+10)&15)] <= new_lj[lj_i][1];
+                            Lja[3][batch ? ((lj_i+10)&15) : ((lj_i+2 )&15)] <= new_lj[lj_i][2];
+                            Lja[4][batch ? ((lj_i+5 )&15) : ((lj_i+13)&15)] <= new_lj[lj_i][3];
+                            Lja[5][batch ? ((lj_i+4 )&15) : ((lj_i+12)&15)] <= new_lj[lj_i][4];
+                            Lja[6][batch ? ((lj_i+1 )&15) : ((lj_i+9 )&15)] <= new_lj[lj_i][5];
+                            Lja[7][batch ? ((lj_i+11)&15) : ((lj_i+3 )&15)] <= new_lj[lj_i][6];
+                        end else begin
+                            Ljb[1][batch ? ((lj_i+6 )&15) : ((lj_i+14)&15)] <= new_lj[lj_i][0];
+                            Ljb[2][batch ? ((lj_i+2 )&15) : ((lj_i+10)&15)] <= new_lj[lj_i][1];
+                            Ljb[3][batch ? ((lj_i+10)&15) : ((lj_i+2 )&15)] <= new_lj[lj_i][2];
+                            Ljb[4][batch ? ((lj_i+5 )&15) : ((lj_i+13)&15)] <= new_lj[lj_i][3];
+                            Ljb[5][batch ? ((lj_i+4 )&15) : ((lj_i+12)&15)] <= new_lj[lj_i][4];
+                            Ljb[6][batch ? ((lj_i+1 )&15) : ((lj_i+9 )&15)] <= new_lj[lj_i][5];
+                            Ljb[7][batch ? ((lj_i+11)&15) : ((lj_i+3 )&15)] <= new_lj[lj_i][6];
                         end
                     end
                 end
 
-                ST_RUN: begin
-                    out_valid <= 1'b0;
-                    out_data <= 8'd0;
-                    out_warn <= 1'b0;
-                    if (batch_cnt == 2'd1) begin
-                        batch_cnt <= 2'd0;
-                        if (layer_cnt == 2'd3) begin
-                            layer_cnt <= 2'd0;
-                            if (!mode_reg)
-                                bank_sel <= ~bank_sel;
-                            state <= ST_CHECK;
+                2'd1: begin
+                    for (lj_i = 0; lj_i < CNU_COUNT; lj_i = lj_i + 1) begin
+                        if (mode_reg || current_bank_sel) begin
+                            Lja[0][batch ? ((lj_i+13)&15) : ((lj_i+5 )&15)] <= new_lj[lj_i][0];
+                            Lja[2][batch ? ((lj_i+6 )&15) : ((lj_i+14)&15)] <= new_lj[lj_i][1];
+                            Lja[3][batch ? ((lj_i+2 )&15) : ((lj_i+10)&15)] <= new_lj[lj_i][2];
+                            Lja[4][batch ? ((lj_i+10)&15) : ((lj_i+2 )&15)] <= new_lj[lj_i][3];
+                            Lja[5][batch ? ((lj_i+5 )&15) : ((lj_i+13)&15)] <= new_lj[lj_i][4];
+                            Lja[6][batch ? ((lj_i+4 )&15) : ((lj_i+12)&15)] <= new_lj[lj_i][5];
+                            Lja[7][batch ? ((lj_i+1 )&15) : ((lj_i+9 )&15)] <= new_lj[lj_i][6];
+                        end else begin
+                            Ljb[0][batch ? ((lj_i+13)&15) : ((lj_i+5 )&15)] <= new_lj[lj_i][0];
+                            Ljb[2][batch ? ((lj_i+6 )&15) : ((lj_i+14)&15)] <= new_lj[lj_i][1];
+                            Ljb[3][batch ? ((lj_i+2 )&15) : ((lj_i+10)&15)] <= new_lj[lj_i][2];
+                            Ljb[4][batch ? ((lj_i+10)&15) : ((lj_i+2 )&15)] <= new_lj[lj_i][3];
+                            Ljb[5][batch ? ((lj_i+5 )&15) : ((lj_i+13)&15)] <= new_lj[lj_i][4];
+                            Ljb[6][batch ? ((lj_i+4 )&15) : ((lj_i+12)&15)] <= new_lj[lj_i][5];
+                            Ljb[7][batch ? ((lj_i+1 )&15) : ((lj_i+9 )&15)] <= new_lj[lj_i][6];
                         end
-                        else begin
-                            layer_cnt <= layer_cnt + 2'd1;
-                        end
-                    end
-                    else begin
-                        batch_cnt <= batch_cnt + 2'd1;
                     end
                 end
 
-                ST_CHECK: begin
-                    if (advance_iter) begin
-                        out_valid <= 1'b0;
-                        out_data <= 8'd0;
-                        out_warn <= 1'b0;
-                        iter_idx <= iter_idx + 3'd1;
-                        layer_cnt <= 2'd0;
-                        batch_cnt <= 2'd1;
-                        state <= ST_RUN;
-                    end
-                    else begin
-                        warn_reg <= syn_nonzero && at_limit;
-                        out_valid <= 1'b1;
-                        if (mode_reg)
-                            out_data <= p_mem0[0];
-                        else if (bank_sel)
-                            out_data <= p_mem1[0];
-                        else
-                            out_data <= p_mem0[0];
-                        out_warn <= syn_nonzero && at_limit;
-                        output_idx <= 7'd1;
-                        state <= ST_OUTPUT;
+                2'd2: begin
+                    for (lj_i = 0; lj_i < CNU_COUNT; lj_i = lj_i + 1) begin
+                        if (mode_reg || current_bank_sel) begin
+                            Lja[0][batch ? ((lj_i+8 )&15) : lj_i] <= new_lj[lj_i][0];
+                            Lja[1][batch ? ((lj_i+13)&15) : ((lj_i+5 )&15)] <= new_lj[lj_i][1];
+                            Lja[3][batch ? ((lj_i+6 )&15) : ((lj_i+14)&15)] <= new_lj[lj_i][2];
+                            Lja[4][batch ? ((lj_i+2 )&15) : ((lj_i+10)&15)] <= new_lj[lj_i][3];
+                            Lja[5][batch ? ((lj_i+10)&15) : ((lj_i+2 )&15)] <= new_lj[lj_i][4];
+                            Lja[6][batch ? ((lj_i+5 )&15) : ((lj_i+13)&15)] <= new_lj[lj_i][5];
+                            Lja[7][batch ? ((lj_i+4 )&15) : ((lj_i+12)&15)] <= new_lj[lj_i][6];
+                        end else begin
+                            Ljb[0][batch ? ((lj_i+8 )&15) : lj_i] <= new_lj[lj_i][0];
+                            Ljb[1][batch ? ((lj_i+13)&15) : ((lj_i+5 )&15)] <= new_lj[lj_i][1];
+                            Ljb[3][batch ? ((lj_i+6 )&15) : ((lj_i+14)&15)] <= new_lj[lj_i][2];
+                            Ljb[4][batch ? ((lj_i+2 )&15) : ((lj_i+10)&15)] <= new_lj[lj_i][3];
+                            Ljb[5][batch ? ((lj_i+10)&15) : ((lj_i+2 )&15)] <= new_lj[lj_i][4];
+                            Ljb[6][batch ? ((lj_i+5 )&15) : ((lj_i+13)&15)] <= new_lj[lj_i][5];
+                            Ljb[7][batch ? ((lj_i+4 )&15) : ((lj_i+12)&15)] <= new_lj[lj_i][6];
+                        end
                     end
                 end
 
-                ST_OUTPUT: begin
-                    out_valid <= 1'b1;
-                    out_warn <= warn_reg;
-                    if (mode_reg)
-                        out_data <= p_mem0[output_idx];
-                    else if (bank_sel)
-                        out_data <= p_mem1[output_idx];
-                    else
-                        out_data <= p_mem0[output_idx];
-
-                    if (output_idx == 7'd127) begin
-                        output_idx <= 7'd0;
-                        state <= ST_IDLE;
-                    end
-                    else begin
-                        output_idx <= output_idx + 7'd1;
+                2'd3: begin
+                    for (lj_i = 0; lj_i < CNU_COUNT; lj_i = lj_i + 1) begin
+                        if (mode_reg || current_bank_sel) begin
+                            Lja[0][batch ? ((lj_i+15)&15) : ((lj_i+7 )&15)] <= new_lj[lj_i][0];
+                            Lja[1][batch ? ((lj_i+8 )&15) : lj_i] <= new_lj[lj_i][1];
+                            Lja[2][batch ? ((lj_i+13)&15) : ((lj_i+5 )&15)] <= new_lj[lj_i][2];
+                            Lja[4][batch ? ((lj_i+6 )&15) : ((lj_i+14)&15)] <= new_lj[lj_i][3];
+                            Lja[5][batch ? ((lj_i+2 )&15) : ((lj_i+10)&15)] <= new_lj[lj_i][4];
+                            Lja[6][batch ? ((lj_i+10)&15) : ((lj_i+2 )&15)] <= new_lj[lj_i][5];
+                            Lja[7][batch ? ((lj_i+5 )&15) : ((lj_i+13)&15)] <= new_lj[lj_i][6];
+                        end else begin
+                            Ljb[0][batch ? ((lj_i+15)&15) : ((lj_i+7 )&15)] <= new_lj[lj_i][0];
+                            Ljb[1][batch ? ((lj_i+8 )&15) : lj_i] <= new_lj[lj_i][1];
+                            Ljb[2][batch ? ((lj_i+13)&15) : ((lj_i+5 )&15)] <= new_lj[lj_i][2];
+                            Ljb[4][batch ? ((lj_i+6 )&15) : ((lj_i+14)&15)] <= new_lj[lj_i][3];
+                            Ljb[5][batch ? ((lj_i+2 )&15) : ((lj_i+10)&15)] <= new_lj[lj_i][4];
+                            Ljb[6][batch ? ((lj_i+10)&15) : ((lj_i+2 )&15)] <= new_lj[lj_i][5];
+                            Ljb[7][batch ? ((lj_i+5 )&15) : ((lj_i+13)&15)] <= new_lj[lj_i][6];
+                        end
                     end
                 end
 
                 default: begin
-                    state <= ST_IDLE;
-                    mode_reg <= 1'b0;
-                    input_idx <= 7'd0;
-                    output_idx <= 7'd0;
-                    iter_idx <= 3'd0;
-                    layer_cnt <= 2'd0;
-                    batch_cnt <= 2'd0;
-                    bank_sel <= 1'b0;
-                    warn_reg <= 1'b0;
-                    out_valid <= 1'b0;
-                    out_data <= 8'd0;
-                    out_warn <= 1'b0;
                 end
             endcase
+        end
+
+        // This write is intentionally concurrent with the first LDPC batch.
+        // Layer 0, batch 0 never targets column 7, position 15.
+        if (late_input_write)
+            Lja[7][15] <= {{2{in_data[5]}}, in_data};
+    end
+
+    integer c2v_k;
+    always @(posedge clk) begin : C2V_WRITEBACK
+        if (ldpc_commit) begin
+            for (c2v_k = 0; c2v_k < CNU_COUNT; c2v_k = c2v_k + 1)
+                c2v[layer][batch][c2v_k] <= c2v_new_lane[c2v_k];
+        end
+    end
+
+    //============================================================
+    // Fixed QC syndrome network
+    //============================================================
+
+    reg [15:0] hard0;
+    reg [15:0] hard1;
+    reg [15:0] hard2;
+    reg [15:0] hard3;
+    reg [15:0] hard4;
+    reg [15:0] hard5;
+    reg [15:0] hard6;
+    reg [15:0] hard7;
+
+    integer hard_i;
+    always @(*) begin : HARD_DECISION
+        for (hard_i = 0; hard_i < 16; hard_i = hard_i + 1) begin
+            if (current_bank_sel) begin
+                hard0[hard_i] = Ljb[0][hard_i][7];
+                hard1[hard_i] = Ljb[1][hard_i][7];
+                hard2[hard_i] = Ljb[2][hard_i][7];
+                hard3[hard_i] = Ljb[3][hard_i][7];
+                hard4[hard_i] = Ljb[4][hard_i][7];
+                hard5[hard_i] = Ljb[5][hard_i][7];
+                hard6[hard_i] = Ljb[6][hard_i][7];
+                hard7[hard_i] = Ljb[7][hard_i][7];
+            end else begin
+                hard0[hard_i] = Lja[0][hard_i][7];
+                hard1[hard_i] = Lja[1][hard_i][7];
+                hard2[hard_i] = Lja[2][hard_i][7];
+                hard3[hard_i] = Lja[3][hard_i][7];
+                hard4[hard_i] = Lja[4][hard_i][7];
+                hard5[hard_i] = Lja[5][hard_i][7];
+                hard6[hard_i] = Lja[6][hard_i][7];
+                hard7[hard_i] = Lja[7][hard_i][7];
+            end
+        end
+    end
+
+    wire [15:0] syn0_pair0;
+    wire [15:0] syn0_pair1;
+    wire [15:0] syn0_pair2;
+    wire [15:0] syn1_pair0;
+    wire [15:0] syn1_pair1;
+    wire [15:0] syn1_pair2;
+    wire [15:0] syn2_pair0;
+    wire [15:0] syn2_pair1;
+    wire [15:0] syn2_pair2;
+    wire [15:0] syn3_pair0;
+    wire [15:0] syn3_pair1;
+    wire [15:0] syn3_pair2;
+    wire [15:0] syn_vec0;
+    wire [15:0] syn_vec1;
+    wire [15:0] syn_vec2;
+    wire [15:0] syn_vec3;
+
+    assign syn0_pair0 = rotate_read16(hard1, 4'd14) ^ rotate_read16(hard2, 4'd10);
+    assign syn0_pair1 = rotate_read16(hard3, 4'd2 ) ^ rotate_read16(hard4, 4'd13);
+    assign syn0_pair2 = rotate_read16(hard5, 4'd12) ^ rotate_read16(hard6, 4'd9 );
+    assign syn_vec0 = (syn0_pair0 ^ syn0_pair1) ^
+                      (syn0_pair2 ^ rotate_read16(hard7, 4'd3));
+
+    assign syn1_pair0 = rotate_read16(hard0, 4'd5 ) ^ rotate_read16(hard2, 4'd14);
+    assign syn1_pair1 = rotate_read16(hard3, 4'd10) ^ rotate_read16(hard4, 4'd2 );
+    assign syn1_pair2 = rotate_read16(hard5, 4'd13) ^ rotate_read16(hard6, 4'd12);
+    assign syn_vec1 = (syn1_pair0 ^ syn1_pair1) ^
+                      (syn1_pair2 ^ rotate_read16(hard7, 4'd9));
+
+    assign syn2_pair0 = hard0 ^ rotate_read16(hard1, 4'd5);
+    assign syn2_pair1 = rotate_read16(hard3, 4'd14) ^ rotate_read16(hard4, 4'd10);
+    assign syn2_pair2 = rotate_read16(hard5, 4'd2 ) ^ rotate_read16(hard6, 4'd13);
+    assign syn_vec2 = (syn2_pair0 ^ syn2_pair1) ^
+                      (syn2_pair2 ^ rotate_read16(hard7, 4'd12));
+
+    assign syn3_pair0 = rotate_read16(hard0, 4'd7) ^ hard1;
+    assign syn3_pair1 = rotate_read16(hard2, 4'd5 ) ^ rotate_read16(hard4, 4'd14);
+    assign syn3_pair2 = rotate_read16(hard5, 4'd10) ^ rotate_read16(hard6, 4'd2 );
+    assign syn_vec3 = (syn3_pair0 ^ syn3_pair1) ^
+                      (syn3_pair2 ^ rotate_read16(hard7, 4'd13));
+
+    assign syndrome_nonzero = |(syn_vec0 | syn_vec1 | syn_vec2 | syn_vec3);
+
+    //============================================================
+    // Registered output
+    //============================================================
+
+    always @(posedge clk or negedge rst_n) begin : OUTPUT_CONTROL
+        if (!rst_n) begin
+            out_valid <= 1'b0;
+            out_data <= 8'd0;
+            out_warn <= 1'b0;
+            output_idx <= 7'd0;
+            final_bank_sel <= 1'b0;
+            warn_reg <= 1'b0;
+        end else if (stop_now) begin
+            final_bank_sel <= current_bank_sel;
+            warn_reg <= at_limit && syndrome_nonzero;
+            out_valid <= 1'b1;
+            out_warn <= at_limit && syndrome_nonzero;
+            if (current_bank_sel)
+                out_data <= Ljb[0][0];
+            else
+                out_data <= Lja[0][0];
+            output_idx <= 7'd1;
+        end else if (state == S_OUTPUT) begin
+            out_valid <= 1'b1;
+            out_warn <= warn_reg;
+            if (final_bank_sel)
+                out_data <= Ljb[output_idx[6:4]][output_idx[3:0]];
+            else
+                out_data <= Lja[output_idx[6:4]][output_idx[3:0]];
+
+            if (output_idx == 7'd127)
+                output_idx <= 7'd0;
+            else
+                output_idx <= output_idx + 7'd1;
+        end else begin
+            out_valid <= 1'b0;
+            out_data <= 8'd0;
+            out_warn <= 1'b0;
+            output_idx <= 7'd0;
         end
     end
 
