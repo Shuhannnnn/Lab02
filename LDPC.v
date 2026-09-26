@@ -175,6 +175,7 @@ module LDPC (
     reg [6:0] output_idx;
     reg [3:0] iteration_cnt;
     reg [2:0] cnu8_cnt;
+    reg       old_c2v_valid;
 
     wire [1:0] layer;
     wire       batch;
@@ -195,7 +196,6 @@ module LDPC (
     wire continue_iter;
     wire stop_now;
     wire ldpc_commit;
-    wire zero_old;
     wire current_bank_sel;
     wire late_input_write;
 
@@ -208,8 +208,8 @@ module LDPC (
     assign at_limit = (iteration_cnt == 4'd8);
     assign continue_iter = check_cycle && syndrome_nonzero && !at_limit;
     assign stop_now = check_cycle && (!syndrome_nonzero || at_limit);
-    assign ldpc_commit = (state == S_LDPC) &&(!check_cycle || continue_iter);
-    assign zero_old = (state == S_LDPC) && (iteration_cnt == 4'd0);
+    assign ldpc_commit = (state == S_LDPC) &&
+                         (!check_cycle || continue_iter);
 
     // Mode 0 uses iteration-level ping-pong. Mode 1 always uses Lja.
     assign current_bank_sel = mode_reg ? 1'b0 : iteration_cnt[0];
@@ -469,6 +469,15 @@ module LDPC (
         end
     end
 
+    always @(posedge clk or negedge rst_n) begin : C2V_VALID_CONTROL
+        if (!rst_n)
+            old_c2v_valid <= 1'b0;
+        else if (in_mode_valid && (state == S_IDLE) && !out_valid)
+            old_c2v_valid <= 1'b0;
+        else if (ldpc_commit && (cnu8_cnt == 3'd7))
+            old_c2v_valid <= 1'b1;
+    end
+
     //============================================================
     // Old C2V reconstruction and edge arithmetic
     //============================================================
@@ -515,7 +524,7 @@ module LDPC (
 
         if (state == S_LDPC) begin
             for (cnu_i = 0; cnu_i < CNU_COUNT; cnu_i = cnu_i + 1) begin
-                if (!zero_old) begin
+                if (old_c2v_valid) begin
                     min1_old[cnu_i] = c2v[layer][batch][cnu_i][19:15];
                     min2_old[cnu_i] = c2v[layer][batch][cnu_i][14:10];
                     min1_idx[cnu_i] = c2v[layer][batch][cnu_i][9:7];
@@ -523,22 +532,17 @@ module LDPC (
                 end
 
                 for (edge_i = 0; edge_i < EDGE_COUNT; edge_i = edge_i + 1) begin
-                    if (zero_old) begin
-                        r_old_mag[cnu_i][edge_i] = 5'd0;
-                        r_old[cnu_i][edge_i] = 6'sd0;
-                    end else begin
-                        if (min1_idx[cnu_i] == edge_i)
-                            r_old_mag[cnu_i][edge_i] = min2_old[cnu_i];
-                        else
-                            r_old_mag[cnu_i][edge_i] = min1_old[cnu_i];
+                    if (min1_idx[cnu_i] == edge_i)
+                        r_old_mag[cnu_i][edge_i] = min2_old[cnu_i];
+                    else
+                        r_old_mag[cnu_i][edge_i] = min1_old[cnu_i];
 
-                        if (c2v_neg[cnu_i][edge_i])
-                            r_old[cnu_i][edge_i] =
-                                -$signed({1'b0, r_old_mag[cnu_i][edge_i]});
-                        else
-                            r_old[cnu_i][edge_i] =
-                                 $signed({1'b0, r_old_mag[cnu_i][edge_i]});
-                    end
+                    if (c2v_neg[cnu_i][edge_i])
+                        r_old[cnu_i][edge_i] =
+                            -$signed({1'b0, r_old_mag[cnu_i][edge_i]});
+                    else
+                        r_old[cnu_i][edge_i] =
+                             $signed({1'b0, r_old_mag[cnu_i][edge_i]});
 
                     r_old_ext[cnu_i][edge_i] =
                         {{2{r_old[cnu_i][edge_i][5]}}, r_old[cnu_i][edge_i]};
