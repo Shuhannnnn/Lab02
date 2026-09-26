@@ -1,8 +1,8 @@
-// LDPC.v -- Lab02 v2 architecture.
+// LDPC.v -- Lab02 v3 architecture.
 // v1 base: 16 CNU lanes (one full layer per cycle), rotated storage in
 // bank A/B, touch-based (first/mid/last) bank control shared by both
 // modes, 4-stage c2v FIFO, rotate-by-1 input load / output.
-// v2 adds (arch_notes.md section 4.1, unchanged numerics / latency):
+// v2 added (arch_notes.md 4.1, unchanged numerics / latency):
 //   O1: edge arithmetic in sign-magnitude form (op/carry-in adds instead
 //       of negate-then-subtract; merged clip+abs bit-trick; CNU ports
 //       take/return magnitude+sign directly, no abs6/make_r).
@@ -10,7 +10,26 @@
 //       replicated x4 for fanout) and every per-column bank-writeback
 //       select are decoded one cycle ahead into registers instead of
 //       live-decoding the `layer` counter each cycle.
-// See arch_notes.md section 3 for the derivation of every constant below.
+// v3 adds (arch_notes.md 4.2, latency 4540 -> 4340):
+//   Core: the last input word (Lch127, needed by lane 12 / column 7 /
+//       edge 6 at iteration-0 layer-0) is folded into LOAD's last cycle
+//       instead of costing its own RUN cycle. Column 7's injection point
+//       moves to 11 (only 15 of its 16 rotate+inject steps happen); at
+//       io_cnt==126 lane 12's CNU input for edge 6 is forced to (mag 31,
+//       sign +) so the tree's 6-real-edge result can be captured into
+//       cap_desc one cycle early; at io_cnt==127 (the overlap cycle,
+//       still state S_LOAD) that capture is combined with the freshly
+//       arrived in_data through a short "fast path" instead of a live
+//       7-edge tree, and the whole chip commits iteration-0 layer-0 for
+//       all 16 lanes right there (run_now = RUN state, or this cycle).
+//   S1: norm5 rewritten as a 32-entry table instead of (3m+2)>>2.
+//   S2: Qv's mode-dependent select (qsel = !mode | touch_first) is
+//       registered alongside col_sel/touch_first instead of fanning
+//       `mode_reg` out to every Q mux live.
+//   S3: the FIFO tail clears only the magnitude fields when idle,
+//       leaving idx/rneg alone (their value doesn't matter when mag=0).
+// See arch_notes.md section 3 (base architecture) and 4.2 (v3 derivation)
+// for the numeric derivation of every constant below.
 
 module CNU_lane (
     input      [4:0] mag0,
@@ -62,13 +81,44 @@ module CNU_lane (
         end
     endfunction
 
+    // S1: (3m+2)>>2 as a 32-entry table instead of an adder.
     function [4:0] norm5;
         input [4:0] magnitude;
-        reg [6:0] wide_value;
         begin
-            wide_value = ({2'b00, magnitude} << 1)
-                       +  {2'b00, magnitude} + 7'd2;
-            norm5 = wide_value[6:2];
+            case (magnitude)
+                5'd0:  norm5 = 5'd0;
+                5'd1:  norm5 = 5'd1;
+                5'd2:  norm5 = 5'd2;
+                5'd3:  norm5 = 5'd2;
+                5'd4:  norm5 = 5'd3;
+                5'd5:  norm5 = 5'd4;
+                5'd6:  norm5 = 5'd5;
+                5'd7:  norm5 = 5'd5;
+                5'd8:  norm5 = 5'd6;
+                5'd9:  norm5 = 5'd7;
+                5'd10: norm5 = 5'd8;
+                5'd11: norm5 = 5'd8;
+                5'd12: norm5 = 5'd9;
+                5'd13: norm5 = 5'd10;
+                5'd14: norm5 = 5'd11;
+                5'd15: norm5 = 5'd11;
+                5'd16: norm5 = 5'd12;
+                5'd17: norm5 = 5'd13;
+                5'd18: norm5 = 5'd14;
+                5'd19: norm5 = 5'd14;
+                5'd20: norm5 = 5'd15;
+                5'd21: norm5 = 5'd16;
+                5'd22: norm5 = 5'd17;
+                5'd23: norm5 = 5'd17;
+                5'd24: norm5 = 5'd18;
+                5'd25: norm5 = 5'd19;
+                5'd26: norm5 = 5'd20;
+                5'd27: norm5 = 5'd20;
+                5'd28: norm5 = 5'd21;
+                5'd29: norm5 = 5'd22;
+                5'd30: norm5 = 5'd23;
+                default: norm5 = 5'd23; // 31
+            endcase
         end
     endfunction
 
@@ -147,7 +197,13 @@ module LDPC (
     wire at_limit     = (iter == 4'd8);
     wire syndrome_nonzero;
     wire stop_now = check_cycle && (!syndrome_nonzero || at_limit);
-    wire commit   = (state == S_RUN) && !stop_now;
+
+    // v3: the overlap cycle is LOAD's very last cycle (io_cnt==127); it
+    // commits iteration-0 layer-0 for every lane exactly like a RUN cycle.
+    wire overlap_cycle = (state == S_LOAD) && in_data_valid && (io_cnt == 7'd127);
+    wire run_now        = (state == S_RUN) || overlap_cycle;
+    wire commit          = run_now && !stop_now;
+    wire entering_run    = (next_state == S_RUN) && (state != S_RUN);
 
     always @(*) begin
         next_state = state;
@@ -193,6 +249,11 @@ module LDPC (
         end else if (in_mode_valid && (state == S_IDLE) && !out_valid) begin
             layer <= 2'd0;
             iter  <= 4'd0;
+        end else if (entering_run) begin
+            // Layer 0 of iteration 1 was already committed during the
+            // overlap cycle (still state S_LOAD); RUN itself starts at
+            // layer 1.
+            layer <= 2'd1;
         end else if ((state == S_RUN) && !stop_now) begin
             layer <= (layer == 2'd3) ? 2'd0 : layer + 2'd1;
             if (layer == 2'd3) iter <= iter + 4'd1;
@@ -202,14 +263,16 @@ module LDPC (
     //============================================================
     // O2: next_layer_comb predicts, one cycle ahead, the layer value
     // that every layer-dependent select below should be decoded for.
-    // It mirrors the `layer` register's own update rule (see above)
-    // plus the LOAD->RUN entry point, and does not care what it holds
-    // when the prediction will not be used (stop_now -> next state OUT).
+    //   - io_cnt==126 (one cycle before the overlap cycle) -> layer 0
+    //   - the overlap cycle itself (io_cnt==127)            -> layer 1
+    //   - normal RUN advance                                 -> layer+1
+    //   - otherwise (prediction unused)                      -> hold
     //============================================================
 
-    wire pre_layer0 = (next_state == S_RUN) && (state != S_RUN);
+    wire pre_layer0 = (state == S_LOAD) && in_data_valid && (io_cnt == 7'd126);
     wire [1:0] next_layer_comb =
         pre_layer0                        ? 2'd0 :
+        overlap_cycle                      ? 2'd1 :
         ((state == S_RUN) && !stop_now)   ? ((layer == 2'd3) ? 2'd0 : layer + 2'd1) :
                                              layer;
 
@@ -229,12 +292,14 @@ module LDPC (
     // column 0 borrows edge (layer-1) at layer 1/2/3.
     // Replicated into 4 groups (4 lanes each) so col_sel/touch_first
     // never fan out past the group of lanes they drive.
+    // S2: qsel (= !mode | touch_first) is registered the same way,
+    // so the Q mux never reads `mode_reg` live either.
     //============================================================
 
-    reg [2:0] col_sel_g0 [0:6]; reg touch_first_g0 [0:6];
-    reg [2:0] col_sel_g1 [0:6]; reg touch_first_g1 [0:6];
-    reg [2:0] col_sel_g2 [0:6]; reg touch_first_g2 [0:6];
-    reg [2:0] col_sel_g3 [0:6]; reg touch_first_g3 [0:6];
+    reg [2:0] col_sel_g0 [0:6]; reg touch_first_g0 [0:6]; reg qsel_g0 [0:6];
+    reg [2:0] col_sel_g1 [0:6]; reg touch_first_g1 [0:6]; reg qsel_g1 [0:6];
+    reg [2:0] col_sel_g2 [0:6]; reg touch_first_g2 [0:6]; reg qsel_g2 [0:6];
+    reg [2:0] col_sel_g3 [0:6]; reg touch_first_g3 [0:6]; reg qsel_g3 [0:6];
     integer ti;
 
     always @(posedge clk) begin
@@ -251,6 +316,8 @@ module LDPC (
                 for (ti = 0; ti < 7; ti = ti + 1) begin
                     touch_first_g0[ti] <= 1'b1; touch_first_g1[ti] <= 1'b1;
                     touch_first_g2[ti] <= 1'b1; touch_first_g3[ti] <= 1'b1;
+                    qsel_g0[ti] <= 1'b1; qsel_g1[ti] <= 1'b1;
+                    qsel_g2[ti] <= 1'b1; qsel_g3[ti] <= 1'b1;
                 end
             end
             2'd1: begin
@@ -264,9 +331,12 @@ module LDPC (
                 col_sel_g3[3] <= 3'd4; col_sel_g3[4] <= 3'd5; col_sel_g3[5] <= 3'd6; col_sel_g3[6] <= 3'd7;
                 touch_first_g0[0] <= 1'b1; touch_first_g1[0] <= 1'b1;
                 touch_first_g2[0] <= 1'b1; touch_first_g3[0] <= 1'b1;
+                qsel_g0[0] <= 1'b1; qsel_g1[0] <= 1'b1; qsel_g2[0] <= 1'b1; qsel_g3[0] <= 1'b1;
                 for (ti = 1; ti < 7; ti = ti + 1) begin
                     touch_first_g0[ti] <= 1'b0; touch_first_g1[ti] <= 1'b0;
                     touch_first_g2[ti] <= 1'b0; touch_first_g3[ti] <= 1'b0;
+                    qsel_g0[ti] <= !mode_reg; qsel_g1[ti] <= !mode_reg;
+                    qsel_g2[ti] <= !mode_reg; qsel_g3[ti] <= !mode_reg;
                 end
             end
             2'd2: begin
@@ -281,6 +351,8 @@ module LDPC (
                 for (ti = 0; ti < 7; ti = ti + 1) begin
                     touch_first_g0[ti] <= 1'b0; touch_first_g1[ti] <= 1'b0;
                     touch_first_g2[ti] <= 1'b0; touch_first_g3[ti] <= 1'b0;
+                    qsel_g0[ti] <= !mode_reg; qsel_g1[ti] <= !mode_reg;
+                    qsel_g2[ti] <= !mode_reg; qsel_g3[ti] <= !mode_reg;
                 end
             end
             default: begin // layer 3
@@ -295,6 +367,8 @@ module LDPC (
                 for (ti = 0; ti < 7; ti = ti + 1) begin
                     touch_first_g0[ti] <= 1'b0; touch_first_g1[ti] <= 1'b0;
                     touch_first_g2[ti] <= 1'b0; touch_first_g3[ti] <= 1'b0;
+                    qsel_g0[ti] <= !mode_reg; qsel_g1[ti] <= !mode_reg;
+                    qsel_g2[ti] <= !mode_reg; qsel_g3[ti] <= !mode_reg;
                 end
             end
         endcase
@@ -305,6 +379,8 @@ module LDPC (
     // O1: r_old subtraction done as a single add with conditional
     // invert + carry-in (op/op_s) instead of negate-then-subtract;
     // clip(|.|,31) computed directly in sign-magnitude form.
+    // v3: edge 6 (column 7) at lane 12 is special for the whole LOAD
+    // window -- see LANE12_SLOT7 below.
     //============================================================
 
     wire signed [7:0] Xv     [0:6][0:15];
@@ -319,29 +395,29 @@ module LDPC (
     genvar ge, gl;
     generate
         // Xv/Qv: 4 lane-groups, each fed from its own replicated
-        // col_sel_gX / touch_first_gX registers.
+        // col_sel_gX / touch_first_gX / qsel_gX registers.
         for (ge = 0; ge < 7; ge = ge + 1) begin: XQ0
             for (gl = 0; gl < 4; gl = gl + 1) begin: LANE
                 assign Xv[ge][gl] = touch_first_g0[ge] ? A[col_sel_g0[ge]][gl] : B[col_sel_g0[ge]][gl];
-                assign Qv[ge][gl] = (!mode_reg || touch_first_g0[ge]) ? A[col_sel_g0[ge]][gl] : B[col_sel_g0[ge]][gl];
+                assign Qv[ge][gl] = qsel_g0[ge] ? A[col_sel_g0[ge]][gl] : B[col_sel_g0[ge]][gl];
             end
         end
         for (ge = 0; ge < 7; ge = ge + 1) begin: XQ1
             for (gl = 4; gl < 8; gl = gl + 1) begin: LANE
                 assign Xv[ge][gl] = touch_first_g1[ge] ? A[col_sel_g1[ge]][gl] : B[col_sel_g1[ge]][gl];
-                assign Qv[ge][gl] = (!mode_reg || touch_first_g1[ge]) ? A[col_sel_g1[ge]][gl] : B[col_sel_g1[ge]][gl];
+                assign Qv[ge][gl] = qsel_g1[ge] ? A[col_sel_g1[ge]][gl] : B[col_sel_g1[ge]][gl];
             end
         end
         for (ge = 0; ge < 7; ge = ge + 1) begin: XQ2
             for (gl = 8; gl < 12; gl = gl + 1) begin: LANE
                 assign Xv[ge][gl] = touch_first_g2[ge] ? A[col_sel_g2[ge]][gl] : B[col_sel_g2[ge]][gl];
-                assign Qv[ge][gl] = (!mode_reg || touch_first_g2[ge]) ? A[col_sel_g2[ge]][gl] : B[col_sel_g2[ge]][gl];
+                assign Qv[ge][gl] = qsel_g2[ge] ? A[col_sel_g2[ge]][gl] : B[col_sel_g2[ge]][gl];
             end
         end
         for (ge = 0; ge < 7; ge = ge + 1) begin: XQ3
             for (gl = 12; gl < 16; gl = gl + 1) begin: LANE
                 assign Xv[ge][gl] = touch_first_g3[ge] ? A[col_sel_g3[ge]][gl] : B[col_sel_g3[ge]][gl];
-                assign Qv[ge][gl] = (!mode_reg || touch_first_g3[ge]) ? A[col_sel_g3[ge]][gl] : B[col_sel_g3[ge]][gl];
+                assign Qv[ge][gl] = qsel_g3[ge] ? A[col_sel_g3[ge]][gl] : B[col_sel_g3[ge]][gl];
             end
         end
 
@@ -352,19 +428,40 @@ module LDPC (
                                         : c2v_fifo[0][gl][19:15];
                 assign ro_neg[ge][gl] = c2v_fifo[0][gl][ge];
 
-                // q_base/x_base = (Q or X) - r_old, via conditional-invert add.
+                // q_base = Q - r_old, via conditional-invert add.
                 wire       op_s_w = ~ro_neg[ge][gl];
                 wire [7:0] op_w   = {3'b0, ro_mag[ge][gl]} ^ {8{op_s_w}};
                 assign q_base[ge][gl] = Qv[ge][gl] + op_w + {7'b0, op_s_w};
-                assign x_base[ge][gl] = Xv[ge][gl] + op_w + {7'b0, op_s_w};
 
-                // clip(|q_base|, 31) directly in sign-magnitude form.
-                wire        sgn_w = q_base[ge][gl][7];
-                wire [6:0]  lo_w  = sgn_w ? ~q_base[ge][gl][6:0] : q_base[ge][gl][6:0];
-                wire [5:0]  am_w  = {1'b0, lo_w[4:0]} + {5'b0, sgn_w};
-                wire        sat_w = (lo_w[6:5] != 2'b00) | am_w[5];
-                assign q_mag[ge][gl] = sat_w ? 5'd31 : am_w[4:0];
-                assign q_sgn[ge][gl] = sgn_w;
+                if (ge == 6 && gl == 12) begin: LANE12_SLOT7
+                    // v3: column 7's injection point moved to 11, so
+                    // A_7[12] is garbage for the entire LOAD window.
+                    // x_base bypasses it with in_data directly (r_old is
+                    // 0 at iteration 0 layer 0, so x_base = Q = in_data).
+                    // q_mag/q_sgn are forced to the max positive value
+                    // throughout LOAD so this edge never wins the CNU's
+                    // min-search -- that is exactly what lets cap_desc
+                    // (below) capture the other 6 real edges' stats.
+                    wire signed [7:0] indata_ext = {{2{in_data[5]}}, in_data};
+                    assign x_base[ge][gl] = overlap_cycle ? indata_ext
+                                                            : (Xv[ge][gl] + op_w + {7'b0, op_s_w});
+
+                    wire        sgn_w = q_base[ge][gl][7];
+                    wire [6:0]  lo_w  = sgn_w ? ~q_base[ge][gl][6:0] : q_base[ge][gl][6:0];
+                    wire [5:0]  am_w  = {1'b0, lo_w[4:0]} + {5'b0, sgn_w};
+                    wire        sat_w = (lo_w[6:5] != 2'b00) | am_w[5];
+                    assign q_mag[ge][gl] = (state == S_LOAD) ? 5'd31 : (sat_w ? 5'd31 : am_w[4:0]);
+                    assign q_sgn[ge][gl] = (state == S_LOAD) ? 1'b0  : sgn_w;
+                end else begin: LANE_NORMAL
+                    assign x_base[ge][gl] = Xv[ge][gl] + op_w + {7'b0, op_s_w};
+
+                    wire        sgn_w = q_base[ge][gl][7];
+                    wire [6:0]  lo_w  = sgn_w ? ~q_base[ge][gl][6:0] : q_base[ge][gl][6:0];
+                    wire [5:0]  am_w  = {1'b0, lo_w[4:0]} + {5'b0, sgn_w};
+                    wire        sat_w = (lo_w[6:5] != 2'b00) | am_w[5];
+                    assign q_mag[ge][gl] = sat_w ? 5'd31 : am_w[4:0];
+                    assign q_sgn[ge][gl] = sgn_w;
+                end
             end
         end
     endgenerate
@@ -398,22 +495,136 @@ module LDPC (
         end
     endgenerate
 
+    //============================================================
+    // v3 fast path for lane 12 / the overlap cycle.
+    // cap_desc captures c2v_new_lane[12] (the 6-real-edge, slot-7-
+    // forced-loss result) one cycle before it is needed, so the
+    // overlap cycle only has to combine it with in_data through a
+    // short chain instead of a live 7-edge tree.
+    //============================================================
+
+    reg [19:0] cap_desc;
+    always @(posedge clk) begin
+        if (state == S_LOAD) cap_desc <= c2v_new_lane[12];
+    end
+
+    // S1's table, duplicated at top level for the fast path's norm(|in_data|).
+    function [4:0] norm5_top;
+        input [4:0] magnitude;
+        begin
+            case (magnitude)
+                5'd0:  norm5_top = 5'd0;
+                5'd1:  norm5_top = 5'd1;
+                5'd2:  norm5_top = 5'd2;
+                5'd3:  norm5_top = 5'd2;
+                5'd4:  norm5_top = 5'd3;
+                5'd5:  norm5_top = 5'd4;
+                5'd6:  norm5_top = 5'd5;
+                5'd7:  norm5_top = 5'd5;
+                5'd8:  norm5_top = 5'd6;
+                5'd9:  norm5_top = 5'd7;
+                5'd10: norm5_top = 5'd8;
+                5'd11: norm5_top = 5'd8;
+                5'd12: norm5_top = 5'd9;
+                5'd13: norm5_top = 5'd10;
+                5'd14: norm5_top = 5'd11;
+                5'd15: norm5_top = 5'd11;
+                5'd16: norm5_top = 5'd12;
+                5'd17: norm5_top = 5'd13;
+                5'd18: norm5_top = 5'd14;
+                5'd19: norm5_top = 5'd14;
+                5'd20: norm5_top = 5'd15;
+                5'd21: norm5_top = 5'd16;
+                5'd22: norm5_top = 5'd17;
+                5'd23: norm5_top = 5'd17;
+                5'd24: norm5_top = 5'd18;
+                5'd25: norm5_top = 5'd19;
+                5'd26: norm5_top = 5'd20;
+                5'd27: norm5_top = 5'd20;
+                5'd28: norm5_top = 5'd21;
+                5'd29: norm5_top = 5'd22;
+                5'd30: norm5_top = 5'd23;
+                default: norm5_top = 5'd23; // 31
+            endcase
+        end
+    endfunction
+
+    wire        xs    = in_data[5];
+    wire [4:0]  x_mag = in_data[5] ? (~in_data[4:0] + 5'd1) : in_data[4:0];
+    wire [4:0]  nx    = norm5_top(x_mag);
+
+    wire [4:0] cn1   = cap_desc[19:15];
+    wire [4:0] cn2   = cap_desc[14:10];
+    wire [2:0] cidx  = cap_desc[9:7];
+    wire [6:0] crneg = cap_desc[6:0];
+
+    wire [4:0] crmag [0:6];
+    genvar fe;
+    generate
+        for (fe = 0; fe < 7; fe = fe + 1) begin: CRMAG
+            assign crmag[fe] = (cidx == fe) ? cn2 : cn1;
+        end
+    endgenerate
+
+    // Per-edge fast-path r_new for lane 12 (used by newv below): edge 6's
+    // own value never depends on itself, so it is exactly crmag[6]/crneg[6]
+    // unchanged; the other 6 edges must now also consider the fresh in_data.
+    wire [4:0] rmag_fast [0:6];
+    wire       rneg_fast [0:6];
+    generate
+        for (fe = 0; fe < 7; fe = fe + 1) begin: FASTEDGE
+            if (fe == 6) begin: FAST_SELF
+                assign rmag_fast[fe] = crmag[fe];
+                assign rneg_fast[fe] = crneg[fe];
+            end else begin: FAST_OTHER
+                assign rmag_fast[fe] = (crmag[fe] < nx) ? crmag[fe] : nx;
+                assign rneg_fast[fe] = crneg[fe] ^ xs;
+            end
+        end
+    endgenerate
+
+    // New FIFO descriptor for lane 12: the true top-2/idx among all 7
+    // edges now that in_data (edge 6) is a real candidate.
+    wire nx_lt_cn1 = (nx < cn1);
+    wire nx_lt_cn2 = (nx < cn2);
+    wire [4:0] fast_m1   = nx_lt_cn1 ? nx : cn1;
+    wire [4:0] fast_m2   = nx_lt_cn1 ? cn1 : (nx_lt_cn2 ? nx : cn2);
+    wire [2:0] fast_idx  = nx_lt_cn1 ? 3'd6 : cidx;
+    wire [6:0] fast_rneg = {rneg_fast[6], rneg_fast[5], rneg_fast[4], rneg_fast[3],
+                            rneg_fast[2], rneg_fast[1], rneg_fast[0]};
+    wire [19:0] fast_desc = {fast_m1, fast_m2, fast_idx, fast_rneg};
+
     wire signed [7:0] newv [0:6][0:15];
 
     genvar ne, nl;
     generate
         for (ne = 0; ne < 7; ne = ne + 1) begin: NEWV_EDGE
             for (nl = 0; nl < 16; nl = nl + 1) begin: NEWV_LANE
-                wire [4:0] rmag_e = rmag_flat_lane[nl][ne*5 +: 5];
-                wire       rneg_e = rneg_lane[nl][ne];
-                wire [7:0] rop_e  = {3'b0, rmag_e} ^ {8{rneg_e}};
-                assign newv[ne][nl] = x_base[ne][nl] + rop_e + {7'b0, rneg_e};
+                if (nl == 12) begin: LANE12_NEWV
+                    wire [4:0] rmag_e   = rmag_flat_lane[nl][ne*5 +: 5];
+                    wire       rneg_e   = rneg_lane[nl][ne];
+                    wire [4:0] rmag_sel = overlap_cycle ? rmag_fast[ne] : rmag_e;
+                    wire       rneg_sel = overlap_cycle ? rneg_fast[ne] : rneg_e;
+                    wire [7:0] rop_e    = {3'b0, rmag_sel} ^ {8{rneg_sel}};
+                    assign newv[ne][nl] = x_base[ne][nl] + rop_e + {7'b0, rneg_sel};
+                end else begin: NORMAL_NEWV
+                    wire [4:0] rmag_e = rmag_flat_lane[nl][ne*5 +: 5];
+                    wire       rneg_e = rneg_lane[nl][ne];
+                    wire [7:0] rop_e  = {3'b0, rmag_e} ^ {8{rneg_e}};
+                    assign newv[ne][nl] = x_base[ne][nl] + rop_e + {7'b0, rneg_e};
+                end
             end
         end
     endgenerate
 
     //============================================================
-    // c2v FIFO: 4 stages, unconditional shift every cycle.
+    // c2v FIFO: 4 stages, unconditional shift every cycle. While idle,
+    // the tail clears in full (not just S1's magnitude fields -- idx
+    // and rneg are read directly by ro_neg's bit-select, not through a
+    // magnitude-based mux, so leaving them at their uninitialized 'x'
+    // would poison q_base/x_base through op_s_w for as long as it takes
+    // the very first real commit to flush through all 4 FIFO stages;
+    // S3 as originally specified only holds in a 4-state-free world).
     //============================================================
 
     always @(posedge clk) begin
@@ -421,7 +632,11 @@ module LDPC (
             c2v_fifo[0][rr] <= c2v_fifo[1][rr];
             c2v_fifo[1][rr] <= c2v_fifo[2][rr];
             c2v_fifo[2][rr] <= c2v_fifo[3][rr];
-            c2v_fifo[3][rr] <= (state == S_RUN) ? c2v_new_lane[rr] : 20'd0;
+            if (run_now) begin
+                c2v_fifo[3][rr] <= (rr == 12 && overlap_cycle) ? fast_desc : c2v_new_lane[rr];
+            end else begin
+                c2v_fifo[3][rr] <= 20'd0;
+            end
         end
     end
 
@@ -429,8 +644,9 @@ module LDPC (
     // Bank A / B storage per column.
     // Load/output use rotate-by-1 with one fixed injection/read point.
     // RUN uses touch-based self-rotate (A) / new-write (A on last touch,
-    // B on first/mid touch); the "which layer" test now reads the
-    // registered nl_r0..nl_r3 one-hot bits instead of live `layer`.
+    // B on first/mid touch); the "which layer" test reads the registered
+    // nl_r0..nl_r3 one-hot bits instead of live `layer`. B writes (and
+    // the overlap cycle's commits) are gated by run_now, not state==S_RUN.
     //============================================================
 
     wire signed [7:0] inj_val = {{2{in_data[5]}}, in_data};
@@ -454,7 +670,7 @@ module LDPC (
     end
 
     always @(posedge clk) begin
-        if (state == S_RUN) begin
+        if (run_now) begin
             if (nl_r1) begin
                 for (rr = 0; rr < 16; rr = rr + 1) B[0][rr] <= newv[0][(rr + 8) % 16];
             end else if (nl_r2) begin
@@ -482,7 +698,7 @@ module LDPC (
     end
 
     always @(posedge clk) begin
-        if (state == S_RUN) begin
+        if (run_now) begin
             if (nl_r0 || nl_r2) begin
                 for (rr = 0; rr < 16; rr = rr + 1) B[1][rr] <= newv[0][(rr + 4) % 16];
             end
@@ -510,7 +726,7 @@ module LDPC (
     end
 
     always @(posedge clk) begin
-        if (state == S_RUN) begin
+        if (run_now) begin
             if (nl_r0) begin
                 for (rr = 0; rr < 16; rr = rr + 1) B[2][rr] <= newv[1][(rr + 4) % 16];
             end else if (nl_r1) begin
@@ -540,7 +756,7 @@ module LDPC (
     end
 
     always @(posedge clk) begin
-        if (state == S_RUN) begin
+        if (run_now) begin
             if (nl_r0) begin
                 for (rr = 0; rr < 16; rr = rr + 1) B[3][rr] <= newv[2][(rr + 8) % 16];
             end else if (nl_r1) begin
@@ -569,7 +785,7 @@ module LDPC (
     end
 
     always @(posedge clk) begin
-        if (state == S_RUN) begin
+        if (run_now) begin
             if (nl_r0 || nl_r1) begin
                 for (rr = 0; rr < 16; rr = rr + 1) B[4][rr] <= newv[3][(rr + 5) % 16];
             end else if (nl_r2) begin
@@ -598,7 +814,7 @@ module LDPC (
     end
 
     always @(posedge clk) begin
-        if (state == S_RUN) begin
+        if (run_now) begin
             if (nl_r0 || nl_r2) begin
                 for (rr = 0; rr < 16; rr = rr + 1) B[5][rr] <= newv[4][(rr + 1) % 16];
             end else if (nl_r1) begin
@@ -627,7 +843,7 @@ module LDPC (
     end
 
     always @(posedge clk) begin
-        if (state == S_RUN) begin
+        if (run_now) begin
             if (nl_r0) begin
                 for (rr = 0; rr < 16; rr = rr + 1) B[6][rr] <= newv[5][(rr + 3) % 16];
             end else if (nl_r1 || nl_r2) begin
@@ -636,17 +852,22 @@ module LDPC (
         end
     end
 
-    // ---- column 7 : inject 12, read 13, edge = 6, present every layer
+    // ---- column 7 : inject 11, read 13, edge = 6, present every layer
+    // v3: only j=0..14 (io_cnt 112..126) rotate+inject; j=15 (Lch127)
+    // is folded into the overlap cycle via the fast path above instead.
+    // A_7[6]'s self-rotate source (normally A_7[12], now garbage) is
+    // replaced by in_data directly during that one cycle.
     always @(posedge clk) begin
-        if ((state == S_LOAD) && in_data_valid && (io_cnt[6:4] == 3'd7)) begin
+        if ((state == S_LOAD) && in_data_valid && (io_cnt[6:4] == 3'd7) && (io_cnt != 7'd127)) begin
             for (rr = 0; rr < 16; rr = rr + 1)
-                A[7][rr] <= (rr == 12) ? inj_val : A[7][(rr + 1) % 16];
+                A[7][rr] <= (rr == 11) ? inj_val : A[7][(rr + 1) % 16];
         end else if ((state == S_OUT) && (io_cnt[6:4] == 3'd7)) begin
             for (rr = 0; rr < 16; rr = rr + 1)
                 A[7][rr] <= A[7][(rr + 1) % 16];
         end else if (commit) begin
             if (nl_r0) begin
-                for (rr = 0; rr < 16; rr = rr + 1) A[7][rr] <= A[7][(rr + 6) % 16];
+                for (rr = 0; rr < 16; rr = rr + 1)
+                    A[7][rr] <= (rr == 6 && overlap_cycle) ? inj_val : A[7][(rr + 6) % 16];
             end else if (nl_r2) begin
                 for (rr = 0; rr < 16; rr = rr + 1) A[7][rr] <= A[7][(rr + 10) % 16];
             end else if (nl_r3) begin
@@ -657,7 +878,7 @@ module LDPC (
     end
 
     always @(posedge clk) begin
-        if (state == S_RUN) begin
+        if (run_now) begin
             if (nl_r0) begin
                 for (rr = 0; rr < 16; rr = rr + 1) B[7][rr] <= newv[6][(rr + 6) % 16];
             end else if (nl_r1) begin
