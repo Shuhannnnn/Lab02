@@ -1,4 +1,4 @@
-// LDPC.v -- Lab02 v4 architecture.
+// LDPC.v -- Lab02 v5 architecture.
 // v1 base: 16 CNU lanes (one full layer per cycle), rotated storage in
 // bank A/B, touch-based (first/mid/last) bank control shared by both
 // modes, 4-stage c2v FIFO, rotate-by-1 input load / output.
@@ -35,7 +35,13 @@
 //       lane 12's edge 6 at the overlap cycle) now reads/forces lane 13
 //       instead of 12, since column 1-6 keep rotating through the whole
 //       LOAD window. See arch5.py / search3.py for the derivation.
-// See arch_notes.md section 3 (base architecture) and 4.2/4.3 (v3/v4
+// v5 (arch_notes.md 4.4, unchanged numerics / latency):
+//   overlap_cycle no longer reads in_data_valid -- see the comment at
+//   its definition below. This keeps in_data_valid's 0.5T input delay
+//   off the run_now/commit path that fans out to every A/B write select,
+//   which was the first slack-0 path found ahead of a T sweep.
+//   (A) lane 12's fast path shares its two nx comparisons (8 -> 2).
+// See arch_notes.md section 3 (base architecture) and 4.2/4.3/4.4 (v3/v4/v5
 // derivation) for the numeric derivation of every constant below.
 
 module CNU_lane (
@@ -207,7 +213,14 @@ module LDPC (
 
     // The overlap cycle is LOAD's very last cycle (io_cnt==127); it
     // commits iteration-0 layer-0 for every lane exactly like a RUN cycle.
-    wire overlap_cycle = (state == S_LOAD) && in_data_valid && (io_cnt == 7'd127);
+    // v5: dropped the in_data_valid term. PATTERN guarantees in_data_valid
+    // is high for exactly 128 consecutive cycles and io_cnt only advances
+    // while it is high, so "LOAD and io_cnt==127" already means this is
+    // that last input cycle. Not reading in_data_valid here keeps its
+    // 0.5T input delay off the overlap_cycle -> run_now -> commit path
+    // that fans out to every A/B write select (this path was slack-0 at
+    // T=10 and would be the first to fail as T sweeps down).
+    wire overlap_cycle = (state == S_LOAD) && (io_cnt == 7'd127);
     wire run_now        = (state == S_RUN) || overlap_cycle;
     wire commit          = run_now && !stop_now;
     wire entering_run    = (next_state == S_RUN) && (state != S_RUN);
@@ -609,6 +622,14 @@ module LDPC (
         end
     endgenerate
 
+    // v5 (A): the two comparisons against in_data's magnitude are shared.
+    // min(select(cn1, cn2), nx) == select(min(cn1, nx), min(cn2, nx)), so
+    // each edge only picks between p1/p2 instead of owning a comparator.
+    wire nx_lt_cn1 = (nx < cn1);
+    wire nx_lt_cn2 = (nx < cn2);
+    wire [4:0] p1 = nx_lt_cn1 ? nx : cn1;
+    wire [4:0] p2 = nx_lt_cn2 ? nx : cn2;
+
     // Per-edge fast-path r_new for lane 12 (used by newv below): edge 6's
     // own value never depends on itself, so it is exactly crmag[6]/crneg[6]
     // unchanged; the other 6 edges must now also consider the fresh in_data.
@@ -620,7 +641,7 @@ module LDPC (
                 assign rmag_fast[fe] = crmag[fe];
                 assign rneg_fast[fe] = crneg[fe];
             end else begin: FAST_OTHER
-                assign rmag_fast[fe] = (crmag[fe] < nx) ? crmag[fe] : nx;
+                assign rmag_fast[fe] = (cidx == fe) ? p2 : p1;
                 assign rneg_fast[fe] = crneg[fe] ^ xs;
             end
         end
@@ -628,10 +649,8 @@ module LDPC (
 
     // New FIFO descriptor for lane 12: the true top-2/idx among all 7
     // edges now that in_data (edge 6) is a real candidate.
-    wire nx_lt_cn1 = (nx < cn1);
-    wire nx_lt_cn2 = (nx < cn2);
-    wire [4:0] fast_m1   = nx_lt_cn1 ? nx : cn1;
-    wire [4:0] fast_m2   = nx_lt_cn1 ? cn1 : (nx_lt_cn2 ? nx : cn2);
+    wire [4:0] fast_m1   = p1;
+    wire [4:0] fast_m2   = nx_lt_cn1 ? cn1 : p2;
     wire [2:0] fast_idx  = nx_lt_cn1 ? 3'd6 : cidx;
     wire [6:0] fast_rneg = {rneg_fast[6], rneg_fast[5], rneg_fast[4], rneg_fast[3],
                             rneg_fast[2], rneg_fast[1], rneg_fast[0]};
