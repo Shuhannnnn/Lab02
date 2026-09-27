@@ -1,3 +1,94 @@
+// LDPC.v -- Lab02 v5 architecture.
+// v1 base: 16 CNU lanes (one full layer per cycle), rotated storage in
+// bank A/B, touch-based (first/mid/last) bank control shared by both
+// modes, 4-stage c2v FIFO, rotate-by-1 input load / output.
+// v2 added (arch_notes.md 4.1, unchanged numerics / latency):
+//   O1: edge arithmetic in sign-magnitude form (op/carry-in adds instead
+//       of negate-then-subtract; merged clip+abs bit-trick; CNU ports
+//       take/return magnitude+sign directly, no abs6/make_r).
+//   O2: the layer-dependent read-side edge table (col_sel/touch_first,
+//       replicated x4 for fanout) and every per-column bank-writeback
+//       select are decoded one cycle ahead into registers instead of
+//       live-decoding the `layer` counter each cycle.
+// v3 added (arch_notes.md 4.2, latency 4540 -> 4340):
+//   Core: the last input word (Lch127, needed by lane 12 / column 7 /
+//       edge 6 at iteration-0 layer-0) is folded into LOAD's last cycle
+//       instead of costing its own RUN cycle, via a capture register
+//       (cap_desc) plus a short fast path combined with in_data.
+//   S1/S2: norm5 as a 32-entry table; qsel registered like touch_first.
+// v4 adds (arch_notes.md 4.3, unchanged numerics / latency):
+//   S6: B drops its "hold" leg for every column except 1/2 (the only two
+//       that hit an absent layer while their B value is still live) --
+//       those columns' B write is now an unconditional 2/3-way select
+//       among its real sources, never gated by run_now.
+//   S7: slot 1 (edge 0)'s B side is hardwired to B[1] -- column 0's B is
+//       never actually selected there (column 0's only slot-1 touch is
+//       its first touch, always reading A), so col_sel never needs to
+//       reach B at all for this edge.
+//   S8: A drops its hold too. Every column now does *something* every
+//       cycle: LOAD/OUTPUT/STOP/IDLE all rotate by 1 (reusing the same
+//       leg instead of a dedicated self-feedback mux), LOAD's injection
+//       point moves accordingly (inj[c] = (-tf[c]-2) mod 16), and each
+//       column's absent-layer action is either a free reuse of an
+//       existing delta-0 leg (columns 0/1) or an explicit rot1 (columns
+//       2/3) depending on which is cheaper. The capture step (for
+//       lane 12's edge 6 at the overlap cycle) now reads/forces lane 13
+//       instead of 12, since column 1-6 keep rotating through the whole
+//       LOAD window. See arch5.py / search3.py for the derivation.
+// v5 (arch_notes.md 4.4, unchanged numerics / latency):
+//   overlap_cycle no longer reads in_data_valid -- see the comment at
+//   its definition below. This keeps in_data_valid's 0.5T input delay
+//   off the run_now/commit path that fans out to every A/B write select,
+//   which was the first slack-0 path found ahead of a T sweep.
+//   (A) lane 12's fast path shares its two nx comparisons (8 -> 2).
+// v7 adds (arch_notes.md 4.8, unchanged numerics / latency; v6's key-CNU
+// was tried and abandoned -- see arch_notes.md's optimization log):
+//   B3: c2v FIFO stage 0 stores a one-hot "hit" vector instead of a
+//       3-bit idx, decoded one stage early (at the stage1->stage0 shift)
+//       so r_old's magnitude mux no longer waits on a live idx compare.
+//   B2 (5-bit): CNU_lane's final (root) merge no longer computes a raw
+//       min1/min2 pair and normalizes it afterward -- norm5 is applied to
+//       the four semifinal candidates in parallel with the root
+//       comparison, and the same comparison outputs select directly among
+//       the already-normalized values. Written as if/else (matching
+//       merge_top2's own structure) rather than a ternary on a separately
+//       -computed comparison reg -- see arch_notes.md 5's v6 lesson: an
+//       `if` on an x-valued condition deterministically takes the else
+//       branch (same as merge_top2), whereas computing the comparison
+//       into a reg first and then selecting with `? :` would let x
+//       propagate through the ternary instead. Harmless on real (2-state)
+//       hardware, but a hang risk in RTL sim while A/B still hold reset x's.
+//   Select replication no longer collapses: qsel_g*/touch_first_g*
+//       diverge during S_OUT (a window where their value is a true
+//       don't-care) so DC's structural CSE can no longer recognize the
+//       4 groups as identical and fold them back into one FF with full
+//       fanout.
+//   B1: the overlap cycle's fast path compares in_data directly against
+//       a threshold table derived from cap_desc's cn1/cn2 (norm is
+//       monotonic, so nx<c is equivalent to |in_data|<thr(c)), instead of
+//       waiting for in_data's own abs+norm (nx) to resolve before the
+//       comparison can run.
+//   cidx != 6: the capture's forced key can never win CNU_lane's tie
+//       (ties favor the lower edge index; edge 6 is the highest), so the
+//       fast path's own edge-6 value is simply cn1 -- no mux needed.
+// v7.1 fixes a v7 regression (arch_notes.md 4.9: v7's real synthesis was
+// far worse than v5, +41.3k, almost entirely from this one mistake):
+//   R1: v7 also diverged col_sel_g* (edges' A/B column index) during
+//       S_OUT, the same trick used for qsel/touch_first above. But
+//       col_sel was a multi-bit *array index*, not a genuine 1-bit
+//       select -- in v5 it only ever took 1 value (edges 3-6, constant,
+//       DC folds it to fixed wiring) or 2 values (edges 0-2, DC folds it
+//       to a 2:1 mux). Making it take don't-care values (0/1/6/7) it
+//       never took in v5 defeated both foldings and forced DC to build a
+//       full multi-input read mux everywhere. Fix: edges 3-6 are now
+//       fixed wiring to A[ge+1]/B[ge+1] (no register at all); edges 0-2
+//       use a genuine 1-bit use_col0_gX[e] (value domain {0,1} even
+//       during the diverging S_OUT window, so the same divergence trick
+//       is safe here, unlike col_sel).
+// See arch_notes.md section 3 (base architecture) and 4.2/4.3/4.4/4.8/4.9
+// (v3/v4/v5/v7/v7.1 derivation) for the numeric derivation of every constant
+// below.
+
 module CNU_lane (
     input      [4:0] mag0,
     input      [4:0] mag1,
@@ -19,10 +110,10 @@ module CNU_lane (
     reg [12:0] pair45;
     reg [12:0] group03;
     reg [12:0] group46;
-    reg [12:0] root_pair;
 
     reg [4:0] norm_min1;
     reg [4:0] norm_min2;
+    reg [2:0] root_idx;
     reg       sign_parity;
 
     function [12:0] merge_top2;
@@ -103,23 +194,45 @@ module CNU_lane (
         pair45   = merge_top2(leaf[4], leaf[5]);
         group03  = merge_top2(pair01, pair23);
         group46  = merge_top2(pair45, leaf[6]);
-        root_pair = merge_top2(group03, group46);
 
-        norm_min1 = norm5(root_pair[12:8]);
-        norm_min2 = norm5(root_pair[4:0]);
+        // B2 (5-bit): instead of merge_top2(group03, group46) followed by
+        // norm5 on its two raw-magnitude outputs, normalize the four
+        // semifinal candidates (a1/a2/b1/b2) in parallel with the root
+        // comparison and select directly among the normalized values.
+        // Bit-exact with the merge-then-normalize form (verified against
+        // it, 200k random cases); keeps normalize off the tail of the
+        // critical path.
+        // Written as if/else, matching merge_top2's own x-handling.
+        begin : ROOT
+            reg [4:0] a1, a2, b1, b2;
+            reg [2:0] idx_a, idx_b;
+            a1 = group03[12:8]; idx_a = group03[7:5]; a2 = group03[4:0];
+            b1 = group46[12:8]; idx_b = group46[7:5]; b2 = group46[4:0];
+            if (a1 <= b1) begin
+                root_idx  = idx_a;
+                norm_min1 = norm5(a1);
+                if (a2 < b1) norm_min2 = norm5(a2);
+                else         norm_min2 = norm5(b1);
+            end else begin
+                root_idx  = idx_b;
+                norm_min1 = norm5(b1);
+                if (b2 < a1) norm_min2 = norm5(b2);
+                else         norm_min2 = norm5(a1);
+            end
+        end
 
         sign_parity = ^qneg;
         rneg = qneg ^ {7{sign_parity}};
 
-        c2v_new = {norm_min1, norm_min2, root_pair[7:5], rneg};
+        c2v_new = {norm_min1, norm_min2, root_idx, rneg};
 
-        rmag_flat[4:0]   = (root_pair[7:5] == 3'd0) ? norm_min2 : norm_min1;
-        rmag_flat[9:5]   = (root_pair[7:5] == 3'd1) ? norm_min2 : norm_min1;
-        rmag_flat[14:10] = (root_pair[7:5] == 3'd2) ? norm_min2 : norm_min1;
-        rmag_flat[19:15] = (root_pair[7:5] == 3'd3) ? norm_min2 : norm_min1;
-        rmag_flat[24:20] = (root_pair[7:5] == 3'd4) ? norm_min2 : norm_min1;
-        rmag_flat[29:25] = (root_pair[7:5] == 3'd5) ? norm_min2 : norm_min1;
-        rmag_flat[34:30] = (root_pair[7:5] == 3'd6) ? norm_min2 : norm_min1;
+        rmag_flat[4:0]   = (root_idx == 3'd0) ? norm_min2 : norm_min1;
+        rmag_flat[9:5]   = (root_idx == 3'd1) ? norm_min2 : norm_min1;
+        rmag_flat[14:10] = (root_idx == 3'd2) ? norm_min2 : norm_min1;
+        rmag_flat[19:15] = (root_idx == 3'd3) ? norm_min2 : norm_min1;
+        rmag_flat[24:20] = (root_idx == 3'd4) ? norm_min2 : norm_min1;
+        rmag_flat[29:25] = (root_idx == 3'd5) ? norm_min2 : norm_min1;
+        rmag_flat[34:30] = (root_idx == 3'd6) ? norm_min2 : norm_min1;
     end
 
 endmodule
@@ -152,7 +265,14 @@ module LDPC (
 
     reg signed [7:0] A [0:7][0:15];
     reg signed [7:0] B [0:7][0:15];
-    reg        [19:0] c2v_fifo [0:3][0:15];
+    // B3: stages 1-3 keep the 20-bit {min1,min2,idx[2:0],rneg[6:0]}
+    // format; stage 0 (the FIFO head, read every cycle for r_old) is
+    // widened to 24 bits {min1,min2,hit[6:0],rneg[6:0]} -- idx is decoded
+    // into a one-hot "hit" vector one stage early (at the stage1->stage0
+    // shift) so ro_mag's magnitude mux no longer waits on a live 3-bit
+    // idx compare.
+    reg        [19:0] c2v_fifo  [1:3][0:15];
+    reg        [23:0] c2v_fifo0 [0:15];
 
     integer rr;
 
@@ -264,29 +384,62 @@ module LDPC (
     //============================================================
     // Per-layer edge table: edge e (0..6) is normally column e+1;
     // column 0 borrows edge (layer-1) at layer 1/2/3.
-    // Replicated into 4 groups (4 lanes each) so col_sel/touch_first
-    // never fan out past the group of lanes they drive.
+    // Replicated into 4 groups (4 lanes each) so touch_first/qsel never
+    // fan out past the group of lanes they drive.
     // S2: qsel (= !mode | touch_first) is registered the same way,
     // so the Q mux never reads `mode_reg` live either.
+    // v7.1 (R1): edges 3-6 never borrow column 0, so they read a fixed
+    // column (A[ge+1]/B[ge+1]) directly -- no select register at all.
+    // Edges 0-2 (which do borrow column 0, at layer e+1) use a 1-bit
+    // use_col0_gX[e] instead of the old 3-bit col_sel_gX[e] array index.
+    // v7's mistake: col_sel was a multi-bit *array index* whose real
+    // value set v5 only ever needed 2 (or 1, constant) entries of; DC
+    // exploited that (constant-folding edges 3-6, 2:1-muxing edges 0-2).
+    // Diverging col_sel's don't-care (S_OUT) value across the 4 groups
+    // (to stop them merging back into one big-fanout FF, same trick as
+    // qsel/touch_first below) defeated that exploitation instead --
+    // DC saw values col_sel never takes in v5 (0/1/6/7) and had to build
+    // a full multi-input read mux for every edge, +41.3k. use_col0 is
+    // genuinely 1-bit (value domain {0,1} even with the divergent S_OUT
+    // constants), so the same divergence trick is safe here.
     //============================================================
 
-    reg [2:0] col_sel_g0 [0:6]; reg touch_first_g0 [0:6]; reg qsel_g0 [0:6];
-    reg [2:0] col_sel_g1 [0:6]; reg touch_first_g1 [0:6]; reg qsel_g1 [0:6];
-    reg [2:0] col_sel_g2 [0:6]; reg touch_first_g2 [0:6]; reg qsel_g2 [0:6];
-    reg [2:0] col_sel_g3 [0:6]; reg touch_first_g3 [0:6]; reg qsel_g3 [0:6];
+    reg touch_first_g0 [0:6]; reg qsel_g0 [0:6]; reg use_col0_g0 [0:2];
+    reg touch_first_g1 [0:6]; reg qsel_g1 [0:6]; reg use_col0_g1 [0:2];
+    reg touch_first_g2 [0:6]; reg qsel_g2 [0:6]; reg use_col0_g2 [0:2];
+    reg touch_first_g3 [0:6]; reg qsel_g3 [0:6]; reg use_col0_g3 [0:2];
     integer ti;
 
+    // v7: during S_OUT the value of touch_first_g*/qsel_g*/use_col0_g* is
+    // a true don't-care (Xv/Qv/CNU results computed in this window are
+    // never latched into A/B/FIFO -- see the per-column write-back blocks
+    // below, none of which read these registers while !commit/!run_now).
+    // DC had folded the 4 identical replicated groups back into one FF
+    // (e.g. qsel_g2_reg, ~768 fanout) because their case(next_layer_comb)
+    // logic was structurally identical in every state. Diverging them
+    // here (constants for g0/g1, io_cnt[0]-derived for g2/g3, so each
+    // group's driving expression is structurally distinct) keeps the
+    // groups from being recognized as mergeable, without touching any
+    // value that matters (RUN, and LOAD's capture/overlap cycles, which
+    // are never in S_OUT).
     always @(posedge clk) begin
-        case (next_layer_comb)
+        if (state == S_OUT) begin
+            for (ti = 0; ti < 7; ti = ti + 1) begin
+                touch_first_g0[ti] <= 1'b0;      qsel_g0[ti] <= 1'b0;
+                touch_first_g1[ti] <= 1'b1;      qsel_g1[ti] <= 1'b1;
+                touch_first_g2[ti] <= io_cnt[0]; qsel_g2[ti] <= io_cnt[0];
+                touch_first_g3[ti] <= ~io_cnt[0]; qsel_g3[ti] <= ~io_cnt[0];
+            end
+            for (ti = 0; ti < 3; ti = ti + 1) begin
+                use_col0_g0[ti] <= 1'b0;      use_col0_g1[ti] <= 1'b1;
+                use_col0_g2[ti] <= io_cnt[0]; use_col0_g3[ti] <= ~io_cnt[0];
+            end
+        end else case (next_layer_comb)
             2'd0: begin
-                col_sel_g0[0] <= 3'd1; col_sel_g0[1] <= 3'd2; col_sel_g0[2] <= 3'd3;
-                col_sel_g0[3] <= 3'd4; col_sel_g0[4] <= 3'd5; col_sel_g0[5] <= 3'd6; col_sel_g0[6] <= 3'd7;
-                col_sel_g1[0] <= 3'd1; col_sel_g1[1] <= 3'd2; col_sel_g1[2] <= 3'd3;
-                col_sel_g1[3] <= 3'd4; col_sel_g1[4] <= 3'd5; col_sel_g1[5] <= 3'd6; col_sel_g1[6] <= 3'd7;
-                col_sel_g2[0] <= 3'd1; col_sel_g2[1] <= 3'd2; col_sel_g2[2] <= 3'd3;
-                col_sel_g2[3] <= 3'd4; col_sel_g2[4] <= 3'd5; col_sel_g2[5] <= 3'd6; col_sel_g2[6] <= 3'd7;
-                col_sel_g3[0] <= 3'd1; col_sel_g3[1] <= 3'd2; col_sel_g3[2] <= 3'd3;
-                col_sel_g3[3] <= 3'd4; col_sel_g3[4] <= 3'd5; col_sel_g3[5] <= 3'd6; col_sel_g3[6] <= 3'd7;
+                use_col0_g0[0] <= 1'b0; use_col0_g0[1] <= 1'b0; use_col0_g0[2] <= 1'b0;
+                use_col0_g1[0] <= 1'b0; use_col0_g1[1] <= 1'b0; use_col0_g1[2] <= 1'b0;
+                use_col0_g2[0] <= 1'b0; use_col0_g2[1] <= 1'b0; use_col0_g2[2] <= 1'b0;
+                use_col0_g3[0] <= 1'b0; use_col0_g3[1] <= 1'b0; use_col0_g3[2] <= 1'b0;
                 for (ti = 0; ti < 7; ti = ti + 1) begin
                     touch_first_g0[ti] <= 1'b1; touch_first_g1[ti] <= 1'b1;
                     touch_first_g2[ti] <= 1'b1; touch_first_g3[ti] <= 1'b1;
@@ -295,14 +448,10 @@ module LDPC (
                 end
             end
             2'd1: begin
-                col_sel_g0[0] <= 3'd0; col_sel_g0[1] <= 3'd2; col_sel_g0[2] <= 3'd3;
-                col_sel_g0[3] <= 3'd4; col_sel_g0[4] <= 3'd5; col_sel_g0[5] <= 3'd6; col_sel_g0[6] <= 3'd7;
-                col_sel_g1[0] <= 3'd0; col_sel_g1[1] <= 3'd2; col_sel_g1[2] <= 3'd3;
-                col_sel_g1[3] <= 3'd4; col_sel_g1[4] <= 3'd5; col_sel_g1[5] <= 3'd6; col_sel_g1[6] <= 3'd7;
-                col_sel_g2[0] <= 3'd0; col_sel_g2[1] <= 3'd2; col_sel_g2[2] <= 3'd3;
-                col_sel_g2[3] <= 3'd4; col_sel_g2[4] <= 3'd5; col_sel_g2[5] <= 3'd6; col_sel_g2[6] <= 3'd7;
-                col_sel_g3[0] <= 3'd0; col_sel_g3[1] <= 3'd2; col_sel_g3[2] <= 3'd3;
-                col_sel_g3[3] <= 3'd4; col_sel_g3[4] <= 3'd5; col_sel_g3[5] <= 3'd6; col_sel_g3[6] <= 3'd7;
+                use_col0_g0[0] <= 1'b1; use_col0_g0[1] <= 1'b0; use_col0_g0[2] <= 1'b0;
+                use_col0_g1[0] <= 1'b1; use_col0_g1[1] <= 1'b0; use_col0_g1[2] <= 1'b0;
+                use_col0_g2[0] <= 1'b1; use_col0_g2[1] <= 1'b0; use_col0_g2[2] <= 1'b0;
+                use_col0_g3[0] <= 1'b1; use_col0_g3[1] <= 1'b0; use_col0_g3[2] <= 1'b0;
                 touch_first_g0[0] <= 1'b1; touch_first_g1[0] <= 1'b1;
                 touch_first_g2[0] <= 1'b1; touch_first_g3[0] <= 1'b1;
                 qsel_g0[0] <= 1'b1; qsel_g1[0] <= 1'b1; qsel_g2[0] <= 1'b1; qsel_g3[0] <= 1'b1;
@@ -314,14 +463,10 @@ module LDPC (
                 end
             end
             2'd2: begin
-                col_sel_g0[0] <= 3'd1; col_sel_g0[1] <= 3'd0; col_sel_g0[2] <= 3'd3;
-                col_sel_g0[3] <= 3'd4; col_sel_g0[4] <= 3'd5; col_sel_g0[5] <= 3'd6; col_sel_g0[6] <= 3'd7;
-                col_sel_g1[0] <= 3'd1; col_sel_g1[1] <= 3'd0; col_sel_g1[2] <= 3'd3;
-                col_sel_g1[3] <= 3'd4; col_sel_g1[4] <= 3'd5; col_sel_g1[5] <= 3'd6; col_sel_g1[6] <= 3'd7;
-                col_sel_g2[0] <= 3'd1; col_sel_g2[1] <= 3'd0; col_sel_g2[2] <= 3'd3;
-                col_sel_g2[3] <= 3'd4; col_sel_g2[4] <= 3'd5; col_sel_g2[5] <= 3'd6; col_sel_g2[6] <= 3'd7;
-                col_sel_g3[0] <= 3'd1; col_sel_g3[1] <= 3'd0; col_sel_g3[2] <= 3'd3;
-                col_sel_g3[3] <= 3'd4; col_sel_g3[4] <= 3'd5; col_sel_g3[5] <= 3'd6; col_sel_g3[6] <= 3'd7;
+                use_col0_g0[0] <= 1'b0; use_col0_g0[1] <= 1'b1; use_col0_g0[2] <= 1'b0;
+                use_col0_g1[0] <= 1'b0; use_col0_g1[1] <= 1'b1; use_col0_g1[2] <= 1'b0;
+                use_col0_g2[0] <= 1'b0; use_col0_g2[1] <= 1'b1; use_col0_g2[2] <= 1'b0;
+                use_col0_g3[0] <= 1'b0; use_col0_g3[1] <= 1'b1; use_col0_g3[2] <= 1'b0;
                 for (ti = 0; ti < 7; ti = ti + 1) begin
                     touch_first_g0[ti] <= 1'b0; touch_first_g1[ti] <= 1'b0;
                     touch_first_g2[ti] <= 1'b0; touch_first_g3[ti] <= 1'b0;
@@ -330,14 +475,10 @@ module LDPC (
                 end
             end
             default: begin // layer 3
-                col_sel_g0[0] <= 3'd1; col_sel_g0[1] <= 3'd2; col_sel_g0[2] <= 3'd0;
-                col_sel_g0[3] <= 3'd4; col_sel_g0[4] <= 3'd5; col_sel_g0[5] <= 3'd6; col_sel_g0[6] <= 3'd7;
-                col_sel_g1[0] <= 3'd1; col_sel_g1[1] <= 3'd2; col_sel_g1[2] <= 3'd0;
-                col_sel_g1[3] <= 3'd4; col_sel_g1[4] <= 3'd5; col_sel_g1[5] <= 3'd6; col_sel_g1[6] <= 3'd7;
-                col_sel_g2[0] <= 3'd1; col_sel_g2[1] <= 3'd2; col_sel_g2[2] <= 3'd0;
-                col_sel_g2[3] <= 3'd4; col_sel_g2[4] <= 3'd5; col_sel_g2[5] <= 3'd6; col_sel_g2[6] <= 3'd7;
-                col_sel_g3[0] <= 3'd1; col_sel_g3[1] <= 3'd2; col_sel_g3[2] <= 3'd0;
-                col_sel_g3[3] <= 3'd4; col_sel_g3[4] <= 3'd5; col_sel_g3[5] <= 3'd6; col_sel_g3[6] <= 3'd7;
+                use_col0_g0[0] <= 1'b0; use_col0_g0[1] <= 1'b0; use_col0_g0[2] <= 1'b1;
+                use_col0_g1[0] <= 1'b0; use_col0_g1[1] <= 1'b0; use_col0_g1[2] <= 1'b1;
+                use_col0_g2[0] <= 1'b0; use_col0_g2[1] <= 1'b0; use_col0_g2[2] <= 1'b1;
+                use_col0_g3[0] <= 1'b0; use_col0_g3[1] <= 1'b0; use_col0_g3[2] <= 1'b1;
                 for (ti = 0; ti < 7; ti = ti + 1) begin
                     touch_first_g0[ti] <= 1'b0; touch_first_g1[ti] <= 1'b0;
                     touch_first_g2[ti] <= 1'b0; touch_first_g3[ti] <= 1'b0;
@@ -370,60 +511,91 @@ module LDPC (
     genvar ge, gl;
     generate
         // Xv/Qv: 4 lane-groups, each fed from its own replicated
-        // col_sel_gX / touch_first_gX / qsel_gX registers. S7: edge 0's
-        // B side is hardwired to B[1] -- column 0's B is never selected
-        // there (its only slot-1 touch is 'first', always reading A).
+        // touch_first_gX / qsel_gX / use_col0_gX registers.
+        // v7.1 (R1): edge 0 keeps S7 (B side hardwired to B[1] -- column
+        // 0's B is never selected there, its only slot-1 touch is
+        // 'first', always reading A). Edges 1-2 mux column 0 in via
+        // use_col0 on both A and B sides. Edges 3-6 never borrow column
+        // 0, so they are fixed wiring to A[ge+1]/B[ge+1] -- no select
+        // register at all.
         for (ge = 0; ge < 7; ge = ge + 1) begin: XQ0
             for (gl = 0; gl < 4; gl = gl + 1) begin: LANE
                 if (ge == 0) begin: EDGE0_S7
-                    assign Xv[ge][gl] = touch_first_g0[ge] ? A[col_sel_g0[ge]][gl] : B[1][gl];
-                    assign Qv[ge][gl] = qsel_g0[ge]        ? A[col_sel_g0[ge]][gl] : B[1][gl];
-                end else begin: EDGE_NORMAL
-                    assign Xv[ge][gl] = touch_first_g0[ge] ? A[col_sel_g0[ge]][gl] : B[col_sel_g0[ge]][gl];
-                    assign Qv[ge][gl] = qsel_g0[ge]        ? A[col_sel_g0[ge]][gl] : B[col_sel_g0[ge]][gl];
+                    wire signed [7:0] a_sel = use_col0_g0[0] ? A[0][gl] : A[1][gl];
+                    assign Xv[ge][gl] = touch_first_g0[ge] ? a_sel : B[1][gl];
+                    assign Qv[ge][gl] = qsel_g0[ge]        ? a_sel : B[1][gl];
+                end else if (ge == 1 || ge == 2) begin: EDGE12_COL0
+                    wire signed [7:0] a_sel = use_col0_g0[ge] ? A[0][gl] : A[ge+1][gl];
+                    wire signed [7:0] b_sel = use_col0_g0[ge] ? B[0][gl] : B[ge+1][gl];
+                    assign Xv[ge][gl] = touch_first_g0[ge] ? a_sel : b_sel;
+                    assign Qv[ge][gl] = qsel_g0[ge]        ? a_sel : b_sel;
+                end else begin: EDGE_FIXED
+                    assign Xv[ge][gl] = touch_first_g0[ge] ? A[ge+1][gl] : B[ge+1][gl];
+                    assign Qv[ge][gl] = qsel_g0[ge]        ? A[ge+1][gl] : B[ge+1][gl];
                 end
             end
         end
         for (ge = 0; ge < 7; ge = ge + 1) begin: XQ1
             for (gl = 4; gl < 8; gl = gl + 1) begin: LANE
                 if (ge == 0) begin: EDGE0_S7
-                    assign Xv[ge][gl] = touch_first_g1[ge] ? A[col_sel_g1[ge]][gl] : B[1][gl];
-                    assign Qv[ge][gl] = qsel_g1[ge]        ? A[col_sel_g1[ge]][gl] : B[1][gl];
-                end else begin: EDGE_NORMAL
-                    assign Xv[ge][gl] = touch_first_g1[ge] ? A[col_sel_g1[ge]][gl] : B[col_sel_g1[ge]][gl];
-                    assign Qv[ge][gl] = qsel_g1[ge]        ? A[col_sel_g1[ge]][gl] : B[col_sel_g1[ge]][gl];
+                    wire signed [7:0] a_sel = use_col0_g1[0] ? A[0][gl] : A[1][gl];
+                    assign Xv[ge][gl] = touch_first_g1[ge] ? a_sel : B[1][gl];
+                    assign Qv[ge][gl] = qsel_g1[ge]        ? a_sel : B[1][gl];
+                end else if (ge == 1 || ge == 2) begin: EDGE12_COL0
+                    wire signed [7:0] a_sel = use_col0_g1[ge] ? A[0][gl] : A[ge+1][gl];
+                    wire signed [7:0] b_sel = use_col0_g1[ge] ? B[0][gl] : B[ge+1][gl];
+                    assign Xv[ge][gl] = touch_first_g1[ge] ? a_sel : b_sel;
+                    assign Qv[ge][gl] = qsel_g1[ge]        ? a_sel : b_sel;
+                end else begin: EDGE_FIXED
+                    assign Xv[ge][gl] = touch_first_g1[ge] ? A[ge+1][gl] : B[ge+1][gl];
+                    assign Qv[ge][gl] = qsel_g1[ge]        ? A[ge+1][gl] : B[ge+1][gl];
                 end
             end
         end
         for (ge = 0; ge < 7; ge = ge + 1) begin: XQ2
             for (gl = 8; gl < 12; gl = gl + 1) begin: LANE
                 if (ge == 0) begin: EDGE0_S7
-                    assign Xv[ge][gl] = touch_first_g2[ge] ? A[col_sel_g2[ge]][gl] : B[1][gl];
-                    assign Qv[ge][gl] = qsel_g2[ge]        ? A[col_sel_g2[ge]][gl] : B[1][gl];
-                end else begin: EDGE_NORMAL
-                    assign Xv[ge][gl] = touch_first_g2[ge] ? A[col_sel_g2[ge]][gl] : B[col_sel_g2[ge]][gl];
-                    assign Qv[ge][gl] = qsel_g2[ge]        ? A[col_sel_g2[ge]][gl] : B[col_sel_g2[ge]][gl];
+                    wire signed [7:0] a_sel = use_col0_g2[0] ? A[0][gl] : A[1][gl];
+                    assign Xv[ge][gl] = touch_first_g2[ge] ? a_sel : B[1][gl];
+                    assign Qv[ge][gl] = qsel_g2[ge]        ? a_sel : B[1][gl];
+                end else if (ge == 1 || ge == 2) begin: EDGE12_COL0
+                    wire signed [7:0] a_sel = use_col0_g2[ge] ? A[0][gl] : A[ge+1][gl];
+                    wire signed [7:0] b_sel = use_col0_g2[ge] ? B[0][gl] : B[ge+1][gl];
+                    assign Xv[ge][gl] = touch_first_g2[ge] ? a_sel : b_sel;
+                    assign Qv[ge][gl] = qsel_g2[ge]        ? a_sel : b_sel;
+                end else begin: EDGE_FIXED
+                    assign Xv[ge][gl] = touch_first_g2[ge] ? A[ge+1][gl] : B[ge+1][gl];
+                    assign Qv[ge][gl] = qsel_g2[ge]        ? A[ge+1][gl] : B[ge+1][gl];
                 end
             end
         end
         for (ge = 0; ge < 7; ge = ge + 1) begin: XQ3
             for (gl = 12; gl < 16; gl = gl + 1) begin: LANE
                 if (ge == 0) begin: EDGE0_S7
-                    assign Xv[ge][gl] = touch_first_g3[ge] ? A[col_sel_g3[ge]][gl] : B[1][gl];
-                    assign Qv[ge][gl] = qsel_g3[ge]        ? A[col_sel_g3[ge]][gl] : B[1][gl];
-                end else begin: EDGE_NORMAL
-                    assign Xv[ge][gl] = touch_first_g3[ge] ? A[col_sel_g3[ge]][gl] : B[col_sel_g3[ge]][gl];
-                    assign Qv[ge][gl] = qsel_g3[ge]        ? A[col_sel_g3[ge]][gl] : B[col_sel_g3[ge]][gl];
+                    wire signed [7:0] a_sel = use_col0_g3[0] ? A[0][gl] : A[1][gl];
+                    assign Xv[ge][gl] = touch_first_g3[ge] ? a_sel : B[1][gl];
+                    assign Qv[ge][gl] = qsel_g3[ge]        ? a_sel : B[1][gl];
+                end else if (ge == 1 || ge == 2) begin: EDGE12_COL0
+                    wire signed [7:0] a_sel = use_col0_g3[ge] ? A[0][gl] : A[ge+1][gl];
+                    wire signed [7:0] b_sel = use_col0_g3[ge] ? B[0][gl] : B[ge+1][gl];
+                    assign Xv[ge][gl] = touch_first_g3[ge] ? a_sel : b_sel;
+                    assign Qv[ge][gl] = qsel_g3[ge]        ? a_sel : b_sel;
+                end else begin: EDGE_FIXED
+                    assign Xv[ge][gl] = touch_first_g3[ge] ? A[ge+1][gl] : B[ge+1][gl];
+                    assign Qv[ge][gl] = qsel_g3[ge]        ? A[ge+1][gl] : B[ge+1][gl];
                 end
             end
         end
 
         for (ge = 0; ge < 7; ge = ge + 1) begin: EDGE
             for (gl = 0; gl < 16; gl = gl + 1) begin: LANE
-                assign ro_mag[ge][gl] = (c2v_fifo[0][gl][9:7] == ge[2:0])
-                                        ? c2v_fifo[0][gl][14:10]
-                                        : c2v_fifo[0][gl][19:15];
-                assign ro_neg[ge][gl] = c2v_fifo[0][gl][ge];
+                // B3: hit[e] was already decoded from idx one stage
+                // earlier (see the FIFO shift below), so r_old's
+                // magnitude select is a plain one-hot mux, not a compare.
+                assign ro_mag[ge][gl] = c2v_fifo0[gl][7 + ge]
+                                        ? c2v_fifo0[gl][18:14]
+                                        : c2v_fifo0[gl][23:19];
+                assign ro_neg[ge][gl] = c2v_fifo0[gl][ge];
 
                 // q_base = Q - r_old, via conditional-invert add.
                 wire       op_s_w = ~ro_neg[ge][gl];
@@ -568,31 +740,70 @@ module LDPC (
     wire [2:0] cidx  = cap_desc[9:7];
     wire [6:0] crneg = cap_desc[6:0];
 
-    wire [4:0] crmag [0:6];
-    genvar fe;
-    generate
-        for (fe = 0; fe < 7; fe = fe + 1) begin: CRMAG
-            assign crmag[fe] = (cidx == fe) ? cn2 : cn1;
+    // B1: thr24(c) = min{m : norm5(m) >= c}. Since norm5 is monotonic
+    // non-decreasing, "nx < c" is equivalent to "|in_data| < thr24(c)".
+    // thr1/thr2 depend only on cap_desc (an FF, stable well before
+    // in_data arrives), so in_data is compared directly against +-thr
+    // instead of waiting for its own abs+norm (nx) to resolve first.
+    function [4:0] thr24;
+        input [4:0] c;
+        begin
+            case (c)
+                5'd0:  thr24 = 5'd0;
+                5'd1:  thr24 = 5'd1;
+                5'd2:  thr24 = 5'd2;
+                5'd3:  thr24 = 5'd4;
+                5'd4:  thr24 = 5'd5;
+                5'd5:  thr24 = 5'd6;
+                5'd6:  thr24 = 5'd8;
+                5'd7:  thr24 = 5'd9;
+                5'd8:  thr24 = 5'd10;
+                5'd9:  thr24 = 5'd12;
+                5'd10: thr24 = 5'd13;
+                5'd11: thr24 = 5'd14;
+                5'd12: thr24 = 5'd16;
+                5'd13: thr24 = 5'd17;
+                5'd14: thr24 = 5'd18;
+                5'd15: thr24 = 5'd20;
+                5'd16: thr24 = 5'd21;
+                5'd17: thr24 = 5'd22;
+                5'd18: thr24 = 5'd24;
+                5'd19: thr24 = 5'd25;
+                5'd20: thr24 = 5'd26;
+                5'd21: thr24 = 5'd28;
+                5'd22: thr24 = 5'd29;
+                default: thr24 = 5'd30; // c == 23
+            endcase
         end
-    endgenerate
+    endfunction
+
+    wire [4:0]        thr1      = thr24(cn1);
+    wire [4:0]        thr2      = thr24(cn2);
+    wire signed [6:0] in_data_s = {in_data[5], in_data};
+    wire signed [6:0] neg_thr1  = -{2'b00, thr1};
+    wire signed [6:0] neg_thr2  = -{2'b00, thr2};
+    wire nx_lt_cn1 = in_data[5] ? (in_data_s > neg_thr1) : (in_data[4:0] < thr1);
+    wire nx_lt_cn2 = in_data[5] ? (in_data_s > neg_thr2) : (in_data[4:0] < thr2);
 
     // v5 (A): the two comparisons against in_data's magnitude are shared.
     // min(select(cn1, cn2), nx) == select(min(cn1, nx), min(cn2, nx)), so
     // each edge only picks between p1/p2 instead of owning a comparator.
-    wire nx_lt_cn1 = (nx < cn1);
-    wire nx_lt_cn2 = (nx < cn2);
     wire [4:0] p1 = nx_lt_cn1 ? nx : cn1;
     wire [4:0] p2 = nx_lt_cn2 ? nx : cn2;
 
     // Per-edge fast-path r_new for lane 12 (used by newv below): edge 6's
-    // own value never depends on itself, so it is exactly crmag[6]/crneg[6]
-    // unchanged; the other 6 edges must now also consider the fresh in_data.
+    // own value never depends on itself. cidx != 6 (its capture-forced
+    // magnitude, 31, can never win CNU_lane's tie -- ties favor the lower
+    // edge index, and edge 6 is the highest), so edge 6's fast-path value
+    // is simply cn1/crneg[6] unchanged, no mux needed. The other 6 edges
+    // must now also consider the fresh in_data.
     wire [4:0] rmag_fast [0:6];
     wire       rneg_fast [0:6];
+    genvar fe;
     generate
         for (fe = 0; fe < 7; fe = fe + 1) begin: FASTEDGE
             if (fe == 6) begin: FAST_SELF
-                assign rmag_fast[fe] = crmag[fe];
+                assign rmag_fast[fe] = cn1;
                 assign rneg_fast[fe] = crneg[fe];
             end else begin: FAST_OTHER
                 assign rmag_fast[fe] = (cidx == fe) ? p2 : p1;
@@ -642,9 +853,28 @@ module LDPC (
     // hazard, but it is real for RTL/gate-level sim).
     //============================================================
 
+    // B3: idx -> one-hot, decoded once at the stage1->stage0 shift instead
+    // of once per r_old read. idx == 0 (the all-zero-desc case that fills
+    // the FIFO while idle) decodes to a fully deterministic hit[0] = 1,
+    // so no x can leak through here even before the first real write.
+    function [6:0] hit_of;
+        input [2:0] idx;
+        begin
+            case (idx)
+                3'd0: hit_of = 7'b0000001;
+                3'd1: hit_of = 7'b0000010;
+                3'd2: hit_of = 7'b0000100;
+                3'd3: hit_of = 7'b0001000;
+                3'd4: hit_of = 7'b0010000;
+                3'd5: hit_of = 7'b0100000;
+                default: hit_of = 7'b1000000; // idx == 6
+            endcase
+        end
+    endfunction
+
     always @(posedge clk) begin
         for (rr = 0; rr < 16; rr = rr + 1) begin
-            c2v_fifo[0][rr] <= c2v_fifo[1][rr];
+            c2v_fifo0[rr] <= {c2v_fifo[1][rr][19:10], hit_of(c2v_fifo[1][rr][9:7]), c2v_fifo[1][rr][6:0]};
             c2v_fifo[1][rr] <= c2v_fifo[2][rr];
             c2v_fifo[2][rr] <= c2v_fifo[3][rr];
             if (run_now) begin
