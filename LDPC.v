@@ -19,10 +19,10 @@ module CNU_lane (
     reg [12:0] pair45;
     reg [12:0] group03;
     reg [12:0] group46;
+    reg [12:0] root_pair;
 
     reg [4:0] norm_min1;
     reg [4:0] norm_min2;
-    reg [2:0] root_idx;
     reg       sign_parity;
 
     function [12:0] merge_top2;
@@ -103,37 +103,23 @@ module CNU_lane (
         pair45   = merge_top2(leaf[4], leaf[5]);
         group03  = merge_top2(pair01, pair23);
         group46  = merge_top2(pair45, leaf[6]);
+        root_pair = merge_top2(group03, group46);
 
-        begin : ROOT
-            reg [4:0] a1, a2, b1, b2;
-            reg [2:0] idx_a, idx_b;
-            a1 = group03[12:8]; idx_a = group03[7:5]; a2 = group03[4:0];
-            b1 = group46[12:8]; idx_b = group46[7:5]; b2 = group46[4:0];
-            if (a1 <= b1) begin
-                root_idx  = idx_a;
-                norm_min1 = norm5(a1);
-                if (a2 < b1) norm_min2 = norm5(a2);
-                else         norm_min2 = norm5(b1);
-            end else begin
-                root_idx  = idx_b;
-                norm_min1 = norm5(b1);
-                if (b2 < a1) norm_min2 = norm5(b2);
-                else         norm_min2 = norm5(a1);
-            end
-        end
+        norm_min1 = norm5(root_pair[12:8]);
+        norm_min2 = norm5(root_pair[4:0]);
 
         sign_parity = ^qneg;
         rneg = qneg ^ {7{sign_parity}};
 
-        c2v_new = {norm_min1, norm_min2, root_idx, rneg};
+        c2v_new = {norm_min1, norm_min2, root_pair[7:5], rneg};
 
-        rmag_flat[4:0]   = (root_idx == 3'd0) ? norm_min2 : norm_min1;
-        rmag_flat[9:5]   = (root_idx == 3'd1) ? norm_min2 : norm_min1;
-        rmag_flat[14:10] = (root_idx == 3'd2) ? norm_min2 : norm_min1;
-        rmag_flat[19:15] = (root_idx == 3'd3) ? norm_min2 : norm_min1;
-        rmag_flat[24:20] = (root_idx == 3'd4) ? norm_min2 : norm_min1;
-        rmag_flat[29:25] = (root_idx == 3'd5) ? norm_min2 : norm_min1;
-        rmag_flat[34:30] = (root_idx == 3'd6) ? norm_min2 : norm_min1;
+        rmag_flat[4:0]   = (root_pair[7:5] == 3'd0) ? norm_min2 : norm_min1;
+        rmag_flat[9:5]   = (root_pair[7:5] == 3'd1) ? norm_min2 : norm_min1;
+        rmag_flat[14:10] = (root_pair[7:5] == 3'd2) ? norm_min2 : norm_min1;
+        rmag_flat[19:15] = (root_pair[7:5] == 3'd3) ? norm_min2 : norm_min1;
+        rmag_flat[24:20] = (root_pair[7:5] == 3'd4) ? norm_min2 : norm_min1;
+        rmag_flat[29:25] = (root_pair[7:5] == 3'd5) ? norm_min2 : norm_min1;
+        rmag_flat[34:30] = (root_pair[7:5] == 3'd6) ? norm_min2 : norm_min1;
     end
 
 endmodule
@@ -166,8 +152,7 @@ module LDPC (
 
     reg signed [7:0] A [0:7][0:15];
     reg signed [7:0] B [0:7][0:15];
-    reg        [19:0] c2v_fifo  [1:3][0:15];
-    reg        [23:0] c2v_fifo0 [0:15];
+    reg        [19:0] c2v_fifo [0:3][0:15];
 
     integer rr;
 
@@ -179,6 +164,16 @@ module LDPC (
     wire at_limit     = (iter == 4'd8);
     wire syndrome_nonzero;
     wire stop_now = check_cycle && (!syndrome_nonzero || at_limit);
+
+    // The overlap cycle is LOAD's very last cycle (io_cnt==127); it
+    // commits iteration-0 layer-0 for every lane exactly like a RUN cycle.
+    // v5: dropped the in_data_valid term. PATTERN guarantees in_data_valid
+    // is high for exactly 128 consecutive cycles and io_cnt only advances
+    // while it is high, so "LOAD and io_cnt==127" already means this is
+    // that last input cycle. Not reading in_data_valid here keeps its
+    // 0.5T input delay off the overlap_cycle -> run_now -> commit path
+    // that fans out to every A/B write select (this path was slack-0 at
+    // T=10 and would be the first to fail as T sweeps down).
     wire overlap_cycle = (state == S_LOAD) && (io_cnt == 7'd127);
     wire run_now        = (state == S_RUN) || overlap_cycle;
     wire commit          = run_now && !stop_now;
@@ -255,6 +250,9 @@ module LDPC (
         ((state == S_RUN) && !stop_now)   ? ((layer == 2'd3) ? 2'd0 : layer + 2'd1) :
                                              layer;
 
+    // Shared one-hot mirror of "current layer", registered one cycle
+    // ahead so the per-column bank-writeback blocks further below never
+    // decode `layer` live; they just read nl_r0..nl_r3.
     reg nl_r0, nl_r1, nl_r2, nl_r3;
     always @(posedge clk) begin
         nl_r0 <= (next_layer_comb == 2'd0);
@@ -263,31 +261,32 @@ module LDPC (
         nl_r3 <= (next_layer_comb == 2'd3);
     end
 
+    //============================================================
+    // Per-layer edge table: edge e (0..6) is normally column e+1;
+    // column 0 borrows edge (layer-1) at layer 1/2/3.
+    // Replicated into 4 groups (4 lanes each) so col_sel/touch_first
+    // never fan out past the group of lanes they drive.
+    // S2: qsel (= !mode | touch_first) is registered the same way,
+    // so the Q mux never reads `mode_reg` live either.
+    //============================================================
 
-    reg touch_first_g0 [0:6]; reg qsel_g0 [0:6]; reg use_col0_g0 [0:2];
-    reg touch_first_g1 [0:6]; reg qsel_g1 [0:6]; reg use_col0_g1 [0:2];
-    reg touch_first_g2 [0:6]; reg qsel_g2 [0:6]; reg use_col0_g2 [0:2];
-    reg touch_first_g3 [0:6]; reg qsel_g3 [0:6]; reg use_col0_g3 [0:2];
+    reg [2:0] col_sel_g0 [0:6]; reg touch_first_g0 [0:6]; reg qsel_g0 [0:6];
+    reg [2:0] col_sel_g1 [0:6]; reg touch_first_g1 [0:6]; reg qsel_g1 [0:6];
+    reg [2:0] col_sel_g2 [0:6]; reg touch_first_g2 [0:6]; reg qsel_g2 [0:6];
+    reg [2:0] col_sel_g3 [0:6]; reg touch_first_g3 [0:6]; reg qsel_g3 [0:6];
     integer ti;
 
     always @(posedge clk) begin
-        if (state == S_OUT) begin
-            for (ti = 0; ti < 7; ti = ti + 1) begin
-                touch_first_g0[ti] <= 1'b0;      qsel_g0[ti] <= 1'b0;
-                touch_first_g1[ti] <= 1'b1;      qsel_g1[ti] <= 1'b1;
-                touch_first_g2[ti] <= io_cnt[0]; qsel_g2[ti] <= io_cnt[0];
-                touch_first_g3[ti] <= ~io_cnt[0]; qsel_g3[ti] <= ~io_cnt[0];
-            end
-            for (ti = 0; ti < 3; ti = ti + 1) begin
-                use_col0_g0[ti] <= 1'b0;      use_col0_g1[ti] <= 1'b1;
-                use_col0_g2[ti] <= io_cnt[0]; use_col0_g3[ti] <= ~io_cnt[0];
-            end
-        end else case (next_layer_comb)
+        case (next_layer_comb)
             2'd0: begin
-                use_col0_g0[0] <= 1'b0; use_col0_g0[1] <= 1'b0; use_col0_g0[2] <= 1'b0;
-                use_col0_g1[0] <= 1'b0; use_col0_g1[1] <= 1'b0; use_col0_g1[2] <= 1'b0;
-                use_col0_g2[0] <= 1'b0; use_col0_g2[1] <= 1'b0; use_col0_g2[2] <= 1'b0;
-                use_col0_g3[0] <= 1'b0; use_col0_g3[1] <= 1'b0; use_col0_g3[2] <= 1'b0;
+                col_sel_g0[0] <= 3'd1; col_sel_g0[1] <= 3'd2; col_sel_g0[2] <= 3'd3;
+                col_sel_g0[3] <= 3'd4; col_sel_g0[4] <= 3'd5; col_sel_g0[5] <= 3'd6; col_sel_g0[6] <= 3'd7;
+                col_sel_g1[0] <= 3'd1; col_sel_g1[1] <= 3'd2; col_sel_g1[2] <= 3'd3;
+                col_sel_g1[3] <= 3'd4; col_sel_g1[4] <= 3'd5; col_sel_g1[5] <= 3'd6; col_sel_g1[6] <= 3'd7;
+                col_sel_g2[0] <= 3'd1; col_sel_g2[1] <= 3'd2; col_sel_g2[2] <= 3'd3;
+                col_sel_g2[3] <= 3'd4; col_sel_g2[4] <= 3'd5; col_sel_g2[5] <= 3'd6; col_sel_g2[6] <= 3'd7;
+                col_sel_g3[0] <= 3'd1; col_sel_g3[1] <= 3'd2; col_sel_g3[2] <= 3'd3;
+                col_sel_g3[3] <= 3'd4; col_sel_g3[4] <= 3'd5; col_sel_g3[5] <= 3'd6; col_sel_g3[6] <= 3'd7;
                 for (ti = 0; ti < 7; ti = ti + 1) begin
                     touch_first_g0[ti] <= 1'b1; touch_first_g1[ti] <= 1'b1;
                     touch_first_g2[ti] <= 1'b1; touch_first_g3[ti] <= 1'b1;
@@ -296,10 +295,14 @@ module LDPC (
                 end
             end
             2'd1: begin
-                use_col0_g0[0] <= 1'b1; use_col0_g0[1] <= 1'b0; use_col0_g0[2] <= 1'b0;
-                use_col0_g1[0] <= 1'b1; use_col0_g1[1] <= 1'b0; use_col0_g1[2] <= 1'b0;
-                use_col0_g2[0] <= 1'b1; use_col0_g2[1] <= 1'b0; use_col0_g2[2] <= 1'b0;
-                use_col0_g3[0] <= 1'b1; use_col0_g3[1] <= 1'b0; use_col0_g3[2] <= 1'b0;
+                col_sel_g0[0] <= 3'd0; col_sel_g0[1] <= 3'd2; col_sel_g0[2] <= 3'd3;
+                col_sel_g0[3] <= 3'd4; col_sel_g0[4] <= 3'd5; col_sel_g0[5] <= 3'd6; col_sel_g0[6] <= 3'd7;
+                col_sel_g1[0] <= 3'd0; col_sel_g1[1] <= 3'd2; col_sel_g1[2] <= 3'd3;
+                col_sel_g1[3] <= 3'd4; col_sel_g1[4] <= 3'd5; col_sel_g1[5] <= 3'd6; col_sel_g1[6] <= 3'd7;
+                col_sel_g2[0] <= 3'd0; col_sel_g2[1] <= 3'd2; col_sel_g2[2] <= 3'd3;
+                col_sel_g2[3] <= 3'd4; col_sel_g2[4] <= 3'd5; col_sel_g2[5] <= 3'd6; col_sel_g2[6] <= 3'd7;
+                col_sel_g3[0] <= 3'd0; col_sel_g3[1] <= 3'd2; col_sel_g3[2] <= 3'd3;
+                col_sel_g3[3] <= 3'd4; col_sel_g3[4] <= 3'd5; col_sel_g3[5] <= 3'd6; col_sel_g3[6] <= 3'd7;
                 touch_first_g0[0] <= 1'b1; touch_first_g1[0] <= 1'b1;
                 touch_first_g2[0] <= 1'b1; touch_first_g3[0] <= 1'b1;
                 qsel_g0[0] <= 1'b1; qsel_g1[0] <= 1'b1; qsel_g2[0] <= 1'b1; qsel_g3[0] <= 1'b1;
@@ -311,10 +314,14 @@ module LDPC (
                 end
             end
             2'd2: begin
-                use_col0_g0[0] <= 1'b0; use_col0_g0[1] <= 1'b1; use_col0_g0[2] <= 1'b0;
-                use_col0_g1[0] <= 1'b0; use_col0_g1[1] <= 1'b1; use_col0_g1[2] <= 1'b0;
-                use_col0_g2[0] <= 1'b0; use_col0_g2[1] <= 1'b1; use_col0_g2[2] <= 1'b0;
-                use_col0_g3[0] <= 1'b0; use_col0_g3[1] <= 1'b1; use_col0_g3[2] <= 1'b0;
+                col_sel_g0[0] <= 3'd1; col_sel_g0[1] <= 3'd0; col_sel_g0[2] <= 3'd3;
+                col_sel_g0[3] <= 3'd4; col_sel_g0[4] <= 3'd5; col_sel_g0[5] <= 3'd6; col_sel_g0[6] <= 3'd7;
+                col_sel_g1[0] <= 3'd1; col_sel_g1[1] <= 3'd0; col_sel_g1[2] <= 3'd3;
+                col_sel_g1[3] <= 3'd4; col_sel_g1[4] <= 3'd5; col_sel_g1[5] <= 3'd6; col_sel_g1[6] <= 3'd7;
+                col_sel_g2[0] <= 3'd1; col_sel_g2[1] <= 3'd0; col_sel_g2[2] <= 3'd3;
+                col_sel_g2[3] <= 3'd4; col_sel_g2[4] <= 3'd5; col_sel_g2[5] <= 3'd6; col_sel_g2[6] <= 3'd7;
+                col_sel_g3[0] <= 3'd1; col_sel_g3[1] <= 3'd0; col_sel_g3[2] <= 3'd3;
+                col_sel_g3[3] <= 3'd4; col_sel_g3[4] <= 3'd5; col_sel_g3[5] <= 3'd6; col_sel_g3[6] <= 3'd7;
                 for (ti = 0; ti < 7; ti = ti + 1) begin
                     touch_first_g0[ti] <= 1'b0; touch_first_g1[ti] <= 1'b0;
                     touch_first_g2[ti] <= 1'b0; touch_first_g3[ti] <= 1'b0;
@@ -323,10 +330,14 @@ module LDPC (
                 end
             end
             default: begin // layer 3
-                use_col0_g0[0] <= 1'b0; use_col0_g0[1] <= 1'b0; use_col0_g0[2] <= 1'b1;
-                use_col0_g1[0] <= 1'b0; use_col0_g1[1] <= 1'b0; use_col0_g1[2] <= 1'b1;
-                use_col0_g2[0] <= 1'b0; use_col0_g2[1] <= 1'b0; use_col0_g2[2] <= 1'b1;
-                use_col0_g3[0] <= 1'b0; use_col0_g3[1] <= 1'b0; use_col0_g3[2] <= 1'b1;
+                col_sel_g0[0] <= 3'd1; col_sel_g0[1] <= 3'd2; col_sel_g0[2] <= 3'd0;
+                col_sel_g0[3] <= 3'd4; col_sel_g0[4] <= 3'd5; col_sel_g0[5] <= 3'd6; col_sel_g0[6] <= 3'd7;
+                col_sel_g1[0] <= 3'd1; col_sel_g1[1] <= 3'd2; col_sel_g1[2] <= 3'd0;
+                col_sel_g1[3] <= 3'd4; col_sel_g1[4] <= 3'd5; col_sel_g1[5] <= 3'd6; col_sel_g1[6] <= 3'd7;
+                col_sel_g2[0] <= 3'd1; col_sel_g2[1] <= 3'd2; col_sel_g2[2] <= 3'd0;
+                col_sel_g2[3] <= 3'd4; col_sel_g2[4] <= 3'd5; col_sel_g2[5] <= 3'd6; col_sel_g2[6] <= 3'd7;
+                col_sel_g3[0] <= 3'd1; col_sel_g3[1] <= 3'd2; col_sel_g3[2] <= 3'd0;
+                col_sel_g3[3] <= 3'd4; col_sel_g3[4] <= 3'd5; col_sel_g3[5] <= 3'd6; col_sel_g3[6] <= 3'd7;
                 for (ti = 0; ti < 7; ti = ti + 1) begin
                     touch_first_g0[ti] <= 1'b0; touch_first_g1[ti] <= 1'b0;
                     touch_first_g2[ti] <= 1'b0; touch_first_g3[ti] <= 1'b0;
@@ -358,81 +369,61 @@ module LDPC (
 
     genvar ge, gl;
     generate
+        // Xv/Qv: 4 lane-groups, each fed from its own replicated
+        // col_sel_gX / touch_first_gX / qsel_gX registers. S7: edge 0's
+        // B side is hardwired to B[1] -- column 0's B is never selected
+        // there (its only slot-1 touch is 'first', always reading A).
         for (ge = 0; ge < 7; ge = ge + 1) begin: XQ0
             for (gl = 0; gl < 4; gl = gl + 1) begin: LANE
                 if (ge == 0) begin: EDGE0_S7
-                    wire signed [7:0] a_sel = use_col0_g0[0] ? A[0][gl] : A[1][gl];
-                    assign Xv[ge][gl] = touch_first_g0[ge] ? a_sel : B[1][gl];
-                    assign Qv[ge][gl] = qsel_g0[ge]        ? a_sel : B[1][gl];
-                end else if (ge == 1 || ge == 2) begin: EDGE12_COL0
-                    wire signed [7:0] a_sel = use_col0_g0[ge] ? A[0][gl] : A[ge+1][gl];
-                    wire signed [7:0] b_sel = use_col0_g0[ge] ? B[0][gl] : B[ge+1][gl];
-                    assign Xv[ge][gl] = touch_first_g0[ge] ? a_sel : b_sel;
-                    assign Qv[ge][gl] = qsel_g0[ge]        ? a_sel : b_sel;
-                end else begin: EDGE_FIXED
-                    assign Xv[ge][gl] = touch_first_g0[ge] ? A[ge+1][gl] : B[ge+1][gl];
-                    assign Qv[ge][gl] = qsel_g0[ge]        ? A[ge+1][gl] : B[ge+1][gl];
+                    assign Xv[ge][gl] = touch_first_g0[ge] ? A[col_sel_g0[ge]][gl] : B[1][gl];
+                    assign Qv[ge][gl] = qsel_g0[ge]        ? A[col_sel_g0[ge]][gl] : B[1][gl];
+                end else begin: EDGE_NORMAL
+                    assign Xv[ge][gl] = touch_first_g0[ge] ? A[col_sel_g0[ge]][gl] : B[col_sel_g0[ge]][gl];
+                    assign Qv[ge][gl] = qsel_g0[ge]        ? A[col_sel_g0[ge]][gl] : B[col_sel_g0[ge]][gl];
                 end
             end
         end
         for (ge = 0; ge < 7; ge = ge + 1) begin: XQ1
             for (gl = 4; gl < 8; gl = gl + 1) begin: LANE
                 if (ge == 0) begin: EDGE0_S7
-                    wire signed [7:0] a_sel = use_col0_g1[0] ? A[0][gl] : A[1][gl];
-                    assign Xv[ge][gl] = touch_first_g1[ge] ? a_sel : B[1][gl];
-                    assign Qv[ge][gl] = qsel_g1[ge]        ? a_sel : B[1][gl];
-                end else if (ge == 1 || ge == 2) begin: EDGE12_COL0
-                    wire signed [7:0] a_sel = use_col0_g1[ge] ? A[0][gl] : A[ge+1][gl];
-                    wire signed [7:0] b_sel = use_col0_g1[ge] ? B[0][gl] : B[ge+1][gl];
-                    assign Xv[ge][gl] = touch_first_g1[ge] ? a_sel : b_sel;
-                    assign Qv[ge][gl] = qsel_g1[ge]        ? a_sel : b_sel;
-                end else begin: EDGE_FIXED
-                    assign Xv[ge][gl] = touch_first_g1[ge] ? A[ge+1][gl] : B[ge+1][gl];
-                    assign Qv[ge][gl] = qsel_g1[ge]        ? A[ge+1][gl] : B[ge+1][gl];
+                    assign Xv[ge][gl] = touch_first_g1[ge] ? A[col_sel_g1[ge]][gl] : B[1][gl];
+                    assign Qv[ge][gl] = qsel_g1[ge]        ? A[col_sel_g1[ge]][gl] : B[1][gl];
+                end else begin: EDGE_NORMAL
+                    assign Xv[ge][gl] = touch_first_g1[ge] ? A[col_sel_g1[ge]][gl] : B[col_sel_g1[ge]][gl];
+                    assign Qv[ge][gl] = qsel_g1[ge]        ? A[col_sel_g1[ge]][gl] : B[col_sel_g1[ge]][gl];
                 end
             end
         end
         for (ge = 0; ge < 7; ge = ge + 1) begin: XQ2
             for (gl = 8; gl < 12; gl = gl + 1) begin: LANE
                 if (ge == 0) begin: EDGE0_S7
-                    wire signed [7:0] a_sel = use_col0_g2[0] ? A[0][gl] : A[1][gl];
-                    assign Xv[ge][gl] = touch_first_g2[ge] ? a_sel : B[1][gl];
-                    assign Qv[ge][gl] = qsel_g2[ge]        ? a_sel : B[1][gl];
-                end else if (ge == 1 || ge == 2) begin: EDGE12_COL0
-                    wire signed [7:0] a_sel = use_col0_g2[ge] ? A[0][gl] : A[ge+1][gl];
-                    wire signed [7:0] b_sel = use_col0_g2[ge] ? B[0][gl] : B[ge+1][gl];
-                    assign Xv[ge][gl] = touch_first_g2[ge] ? a_sel : b_sel;
-                    assign Qv[ge][gl] = qsel_g2[ge]        ? a_sel : b_sel;
-                end else begin: EDGE_FIXED
-                    assign Xv[ge][gl] = touch_first_g2[ge] ? A[ge+1][gl] : B[ge+1][gl];
-                    assign Qv[ge][gl] = qsel_g2[ge]        ? A[ge+1][gl] : B[ge+1][gl];
+                    assign Xv[ge][gl] = touch_first_g2[ge] ? A[col_sel_g2[ge]][gl] : B[1][gl];
+                    assign Qv[ge][gl] = qsel_g2[ge]        ? A[col_sel_g2[ge]][gl] : B[1][gl];
+                end else begin: EDGE_NORMAL
+                    assign Xv[ge][gl] = touch_first_g2[ge] ? A[col_sel_g2[ge]][gl] : B[col_sel_g2[ge]][gl];
+                    assign Qv[ge][gl] = qsel_g2[ge]        ? A[col_sel_g2[ge]][gl] : B[col_sel_g2[ge]][gl];
                 end
             end
         end
         for (ge = 0; ge < 7; ge = ge + 1) begin: XQ3
             for (gl = 12; gl < 16; gl = gl + 1) begin: LANE
                 if (ge == 0) begin: EDGE0_S7
-                    wire signed [7:0] a_sel = use_col0_g3[0] ? A[0][gl] : A[1][gl];
-                    assign Xv[ge][gl] = touch_first_g3[ge] ? a_sel : B[1][gl];
-                    assign Qv[ge][gl] = qsel_g3[ge]        ? a_sel : B[1][gl];
-                end else if (ge == 1 || ge == 2) begin: EDGE12_COL0
-                    wire signed [7:0] a_sel = use_col0_g3[ge] ? A[0][gl] : A[ge+1][gl];
-                    wire signed [7:0] b_sel = use_col0_g3[ge] ? B[0][gl] : B[ge+1][gl];
-                    assign Xv[ge][gl] = touch_first_g3[ge] ? a_sel : b_sel;
-                    assign Qv[ge][gl] = qsel_g3[ge]        ? a_sel : b_sel;
-                end else begin: EDGE_FIXED
-                    assign Xv[ge][gl] = touch_first_g3[ge] ? A[ge+1][gl] : B[ge+1][gl];
-                    assign Qv[ge][gl] = qsel_g3[ge]        ? A[ge+1][gl] : B[ge+1][gl];
+                    assign Xv[ge][gl] = touch_first_g3[ge] ? A[col_sel_g3[ge]][gl] : B[1][gl];
+                    assign Qv[ge][gl] = qsel_g3[ge]        ? A[col_sel_g3[ge]][gl] : B[1][gl];
+                end else begin: EDGE_NORMAL
+                    assign Xv[ge][gl] = touch_first_g3[ge] ? A[col_sel_g3[ge]][gl] : B[col_sel_g3[ge]][gl];
+                    assign Qv[ge][gl] = qsel_g3[ge]        ? A[col_sel_g3[ge]][gl] : B[col_sel_g3[ge]][gl];
                 end
             end
         end
 
         for (ge = 0; ge < 7; ge = ge + 1) begin: EDGE
             for (gl = 0; gl < 16; gl = gl + 1) begin: LANE
-                assign ro_mag[ge][gl] = c2v_fifo0[gl][7 + ge]
-                                        ? c2v_fifo0[gl][18:14]
-                                        : c2v_fifo0[gl][23:19];
-                assign ro_neg[ge][gl] = c2v_fifo0[gl][ge];
+                assign ro_mag[ge][gl] = (c2v_fifo[0][gl][9:7] == ge[2:0])
+                                        ? c2v_fifo[0][gl][14:10]
+                                        : c2v_fifo[0][gl][19:15];
+                assign ro_neg[ge][gl] = c2v_fifo[0][gl][ge];
 
                 // q_base = Q - r_old, via conditional-invert add.
                 wire       op_s_w = ~ro_neg[ge][gl];
@@ -454,6 +445,15 @@ module LDPC (
                     assign q_mag[ge][gl] = sat_w ? 5'd31 : am_w[4:0];
                     assign q_sgn[ge][gl] = sgn_w;
                 end else if (ge == 6 && gl == 13) begin: LANE13_SLOT7
+                    // Capture cycle input: forced to (mag 31, sign +) for
+                    // the whole LOAD window so this edge never wins the
+                    // CNU's min-search -- that is exactly what lets
+                    // cap_desc (below) capture the other 6 real edges'
+                    // stats. Column 1-6 keep rotating through all of LOAD
+                    // now (S8), so by the time it matters (cycle 126) the
+                    // stale, never-injected value has rotated to lane 13
+                    // (one step ahead of lane 12, which is where the
+                    // overlap cycle itself will look).
                     assign x_base[ge][gl] = Xv[ge][gl] + op_w + {7'b0, op_s_w};
 
                     wire        sgn_w = q_base[ge][gl][7];
@@ -568,55 +568,31 @@ module LDPC (
     wire [2:0] cidx  = cap_desc[9:7];
     wire [6:0] crneg = cap_desc[6:0];
 
-    function [4:0] thr24;
-        input [4:0] c;
-        begin
-            case (c)
-                5'd0:  thr24 = 5'd0;
-                5'd1:  thr24 = 5'd1;
-                5'd2:  thr24 = 5'd2;
-                5'd3:  thr24 = 5'd4;
-                5'd4:  thr24 = 5'd5;
-                5'd5:  thr24 = 5'd6;
-                5'd6:  thr24 = 5'd8;
-                5'd7:  thr24 = 5'd9;
-                5'd8:  thr24 = 5'd10;
-                5'd9:  thr24 = 5'd12;
-                5'd10: thr24 = 5'd13;
-                5'd11: thr24 = 5'd14;
-                5'd12: thr24 = 5'd16;
-                5'd13: thr24 = 5'd17;
-                5'd14: thr24 = 5'd18;
-                5'd15: thr24 = 5'd20;
-                5'd16: thr24 = 5'd21;
-                5'd17: thr24 = 5'd22;
-                5'd18: thr24 = 5'd24;
-                5'd19: thr24 = 5'd25;
-                5'd20: thr24 = 5'd26;
-                5'd21: thr24 = 5'd28;
-                5'd22: thr24 = 5'd29;
-                default: thr24 = 5'd30; // c == 23
-            endcase
+    wire [4:0] crmag [0:6];
+    genvar fe;
+    generate
+        for (fe = 0; fe < 7; fe = fe + 1) begin: CRMAG
+            assign crmag[fe] = (cidx == fe) ? cn2 : cn1;
         end
-    endfunction
+    endgenerate
 
-    wire [4:0]        thr1      = thr24(cn1);
-    wire [4:0]        thr2      = thr24(cn2);
-    wire signed [6:0] in_data_s = {in_data[5], in_data};
-    wire signed [6:0] neg_thr1  = -{2'b00, thr1};
-    wire signed [6:0] neg_thr2  = -{2'b00, thr2};
-    wire nx_lt_cn1 = in_data[5] ? (in_data_s > neg_thr1) : (in_data[4:0] < thr1);
-    wire nx_lt_cn2 = in_data[5] ? (in_data_s > neg_thr2) : (in_data[4:0] < thr2);
-
+    // v5 (A): the two comparisons against in_data's magnitude are shared.
+    // min(select(cn1, cn2), nx) == select(min(cn1, nx), min(cn2, nx)), so
+    // each edge only picks between p1/p2 instead of owning a comparator.
+    wire nx_lt_cn1 = (nx < cn1);
+    wire nx_lt_cn2 = (nx < cn2);
     wire [4:0] p1 = nx_lt_cn1 ? nx : cn1;
     wire [4:0] p2 = nx_lt_cn2 ? nx : cn2;
+
+    // Per-edge fast-path r_new for lane 12 (used by newv below): edge 6's
+    // own value never depends on itself, so it is exactly crmag[6]/crneg[6]
+    // unchanged; the other 6 edges must now also consider the fresh in_data.
     wire [4:0] rmag_fast [0:6];
     wire       rneg_fast [0:6];
-    genvar fe;
     generate
         for (fe = 0; fe < 7; fe = fe + 1) begin: FASTEDGE
             if (fe == 6) begin: FAST_SELF
-                assign rmag_fast[fe] = cn1;
+                assign rmag_fast[fe] = crmag[fe];
                 assign rneg_fast[fe] = crneg[fe];
             end else begin: FAST_OTHER
                 assign rmag_fast[fe] = (cidx == fe) ? p2 : p1;
@@ -666,24 +642,9 @@ module LDPC (
     // hazard, but it is real for RTL/gate-level sim).
     //============================================================
 
-    function [6:0] hit_of;
-        input [2:0] idx;
-        begin
-            case (idx)
-                3'd0: hit_of = 7'b0000001;
-                3'd1: hit_of = 7'b0000010;
-                3'd2: hit_of = 7'b0000100;
-                3'd3: hit_of = 7'b0001000;
-                3'd4: hit_of = 7'b0010000;
-                3'd5: hit_of = 7'b0100000;
-                default: hit_of = 7'b1000000; // idx == 6
-            endcase
-        end
-    endfunction
-
     always @(posedge clk) begin
         for (rr = 0; rr < 16; rr = rr + 1) begin
-            c2v_fifo0[rr] <= {c2v_fifo[1][rr][19:10], hit_of(c2v_fifo[1][rr][9:7]), c2v_fifo[1][rr][6:0]};
+            c2v_fifo[0][rr] <= c2v_fifo[1][rr];
             c2v_fifo[1][rr] <= c2v_fifo[2][rr];
             c2v_fifo[2][rr] <= c2v_fifo[3][rr];
             if (run_now) begin
@@ -694,6 +655,26 @@ module LDPC (
         end
     end
 
+    //============================================================
+    // Bank A / B storage per column.
+    //
+    // S8 (A): every column does something every cycle -- no dedicated
+    // "hold" leg anywhere. Priority per column: (1) commit -> the
+    // touch-based schedule below (self-rotate / new-write / an explicit
+    // rot1 for an absent layer that needs compensation); (2) this
+    // column's own LOAD injection window (rotate-by-1, overwriting one
+    // position with in_data); (3) otherwise, plain rotate-by-1 -- this
+    // covers IDLE, LOAD cycles that are not this column's turn, all of
+    // OUTPUT, and the cycle where RUN decides to stop.
+    // Injection points inj[c] = (-tf[c]-2) mod 16 = [9,0,4,12,1,2,5,11]
+    // (one earlier than v3's, to compensate for every column rotating
+    // through the other columns' LOAD windows too).
+    //
+    // S6 (B): only columns 1 and 2 keep an explicit hold (they are the
+    // only two that hit an absent layer while their B value is still
+    // between first and last touch). Every other column's B write is
+    // an unconditional select among its real sources, never gated.
+    //============================================================
 
     wire signed [7:0] inj_val = {{2{in_data[5]}}, in_data};
 
@@ -869,6 +850,10 @@ module LDPC (
             B[6][rr] <= nl_r0 ? newv[5][(rr + 3) % 16] : newv[5][(rr + 14) % 16];
     end
 
+    // ---- column 7 : inject 11, read 13, edge = 6, present every layer.
+    // Only j=0..14 (io_cnt 112..126) rotate+inject; j=15 (Lch127) is
+    // folded into the overlap cycle instead. A_7[6]'s self-rotate source
+    // (normally A_7[12]) is replaced by in_data directly during that cycle.
     always @(posedge clk) begin
         if (commit) begin
             if (nl_r0) begin
