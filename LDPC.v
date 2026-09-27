@@ -1,4 +1,4 @@
-// LDPC.v -- Lab02 v5 architecture.
+// LDPC.v -- Lab02 v6_noB2 architecture.
 // v1 base: 16 CNU lanes (one full layer per cycle), rotated storage in
 // bank A/B, touch-based (first/mid/last) bank control shared by both
 // modes, 4-stage c2v FIFO, rotate-by-1 input load / output.
@@ -59,13 +59,10 @@
 //       through abs+norm first. Also drops the now-unneeded crmag mux
 //       (edge 6's capture-forced key can never win the tie, so its fast
 //       path value is simply cn1).
-//   v6-3 (B2): CNU_lane's final (root) merge no longer computes a raw
-//       min1/min2 pair and normalizes it afterward -- the same
-//       comparison outputs (sel/c1/c2) select directly among the four
-//       semifinal candidates' *already-normalized* values (computed by
-//       nk64 in parallel with the comparison), which is bit-exact with
-//       merge-then-normalize but keeps normalize off the tail of the
-//       critical path.
+// v6_noB2 keeps v6-1 and v6-2 but removes v6-3 (B2): CNU_lane's
+// final merge now selects the raw min1/min2 keys first and applies nk64
+// only to those two root outputs. This is numerically equivalent and
+// trades root-path timing for lower CNU area.
 // See arch_notes.md section 3 (base architecture) and 4.2/4.3/4.4/4.6
 // (v3/v4/v5/v6 derivation) for the numeric derivation of every constant
 // below.
@@ -91,6 +88,7 @@ module CNU_lane (
     reg [14:0] pair45;
     reg [14:0] group03;
     reg [14:0] group46;
+    reg [14:0] root_pair;
 
     reg [4:0] norm_min1;
     reg [4:0] norm_min2;
@@ -215,37 +213,11 @@ module CNU_lane (
         group03 = merge_top2(pair01, pair23);
         group46 = merge_top2(pair45, leaf[6]);
 
-        // v6-3 (B2): instead of merge_top2(group03, group46) followed by
-        // nk64 on its two raw-key outputs, normalize the four semifinal
-        // candidates (a1/a2/b1/b2) in parallel with the root comparison
-        // and select directly among the normalized values. Bit-exact with
-        // the merge-then-normalize form (verified against it); keeps
-        // normalize off the tail of the critical path.
-        begin : ROOT
-            reg [5:0] a1, a2, b1, b2;
-            reg [2:0] idx_a, idx_b;
-            a1 = group03[14:9]; idx_a = group03[8:6]; a2 = group03[5:0];
-            b1 = group46[14:9]; idx_b = group46[8:6]; b2 = group46[5:0];
-            // Written as if/else (matching merge_top2's own structure)
-            // rather than a ternary on a separately-computed comparison
-            // reg: an `if` on an x-valued condition deterministically
-            // takes the else branch (same as merge_top2), whereas
-            // `sel = (a<=b); sel ? .. : ..` would let x propagate through
-            // the ternary instead -- a simulation-only x-handling gap
-            // between the two forms, harmless on real (2-state) hardware
-            // but a hang risk in RTL sim while A/B still hold reset x's.
-            if (a1 <= b1) begin
-                root_idx  = idx_a;
-                norm_min1 = nk64(a1);
-                if (a2 < b1) norm_min2 = nk64(a2);
-                else         norm_min2 = nk64(b1);
-            end else begin
-                root_idx  = idx_b;
-                norm_min1 = nk64(b1);
-                if (b2 < a1) norm_min2 = nk64(b2);
-                else         norm_min2 = nk64(a1);
-            end
-        end
+        // v6_noB2: merge raw keys before normalizing the two root minima.
+        root_pair = merge_top2(group03, group46);
+        root_idx  = root_pair[8:6];
+        norm_min1 = nk64(root_pair[14:9]);
+        norm_min2 = nk64(root_pair[5:0]);
 
         sign_parity = ^qneg;
         rneg = qneg ^ {7{sign_parity}};
