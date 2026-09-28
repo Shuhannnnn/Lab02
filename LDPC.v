@@ -41,62 +41,43 @@
 //   off the run_now/commit path that fans out to every A/B write select,
 //   which was the first slack-0 path found ahead of a T sweep.
 //   (A) lane 12's fast path shares its two nx comparisons (8 -> 2).
-// v7 adds (arch_notes.md 4.8, unchanged numerics / latency; v6's key-CNU
-// was tried and abandoned -- see arch_notes.md's optimization log):
-//   B3: c2v FIFO stage 0 stores a one-hot "hit" vector instead of a
-//       3-bit idx, decoded one stage early (at the stage1->stage0 shift)
-//       so r_old's magnitude mux no longer waits on a live idx compare.
-//   B2 (5-bit): CNU_lane's final (root) merge no longer computes a raw
-//       min1/min2 pair and normalizes it afterward -- norm5 is applied to
-//       the four semifinal candidates in parallel with the root
-//       comparison, and the same comparison outputs select directly among
-//       the already-normalized values. Written as if/else (matching
-//       merge_top2's own structure) rather than a ternary on a separately
-//       -computed comparison reg -- see arch_notes.md 5's v6 lesson: an
-//       `if` on an x-valued condition deterministically takes the else
-//       branch (same as merge_top2), whereas computing the comparison
-//       into a reg first and then selecting with `? :` would let x
-//       propagate through the ternary instead. Harmless on real (2-state)
-//       hardware, but a hang risk in RTL sim while A/B still hold reset x's.
-//   Select replication no longer collapses: qsel_g*/touch_first_g*
-//       diverge during S_OUT (a window where their value is a true
-//       don't-care) so DC's structural CSE can no longer recognize the
-//       4 groups as identical and fold them back into one FF with full
-//       fanout.
-//   B1: the overlap cycle's fast path compares in_data directly against
-//       a threshold table derived from cap_desc's cn1/cn2 (norm is
-//       monotonic, so nx<c is equivalent to |in_data|<thr(c)), instead of
-//       waiting for in_data's own abs+norm (nx) to resolve before the
-//       comparison can run.
-//   cidx != 6: the capture's forced key can never win CNU_lane's tie
-//       (ties favor the lower edge index; edge 6 is the highest), so the
-//       fast path's own edge-6 value is simply cn1 -- no mux needed.
-// v7.1 fixes a v7 regression (arch_notes.md 4.9: v7's real synthesis was
-// far worse than v5, +41.3k, almost entirely from this one mistake):
-//   R1: v7 also diverged col_sel_g* (edges' A/B column index) during
-//       S_OUT, the same trick used for qsel/touch_first above. But
-//       col_sel was a multi-bit *array index*, not a genuine 1-bit
-//       select -- in v5 it only ever took 1 value (edges 3-6, constant,
-//       DC folds it to fixed wiring) or 2 values (edges 0-2, DC folds it
-//       to a 2:1 mux). Making it take don't-care values (0/1/6/7) it
-//       never took in v5 defeated both foldings and forced DC to build a
-//       full multi-input read mux everywhere. Fix: edges 3-6 are now
-//       fixed wiring to A[ge+1]/B[ge+1] (no register at all); edges 0-2
-//       use a genuine 1-bit use_col0_gX[e] (value domain {0,1} even
-//       during the diverging S_OUT window, so the same divergence trick
-//       is safe here, unlike col_sel).
-// See arch_notes.md section 3 (base architecture) and 4.2/4.3/4.4/4.8/4.9
-// (v3/v4/v5/v7/v7.1 derivation) for the numeric derivation of every constant
+// v6 adds (arch_notes.md 4.6, unchanged numerics / latency):
+//   v6-1 (key CNU): each edge's exact two's-complement magnitude (which
+//       needed a per-edge +1 incrementer to turn one's-complement into
+//       two's-complement) is replaced by a 6-bit key K = {one's-complement
+//       magnitude, sign} that CNU_lane's tree compares directly. The
+//       deferred +1 correction and the (3m+2)>>2 normalize are folded into
+//       one 64-entry table (nk64) applied only at the two root outputs
+//       instead of once per edge -- 112 per-edge incrementers become 32
+//       table lookups (16 lanes x 2 outputs).
+//   v6-2 (B1): the overlap cycle's fast path no longer waits for
+//       norm(|in_data|) to gate its two comparisons against cap_desc's
+//       cn1/cn2 -- since norm is monotonic, nx<c is equivalent to
+//       |in_data|<thr(c) for a precomputed threshold table (thr24),
+//       which only depends on cap_desc (stable well before in_data
+//       arrives). in_data is compared directly against +-thr instead of
+//       through abs+norm first. Also drops the now-unneeded crmag mux
+//       (edge 6's capture-forced key can never win the tie, so its fast
+//       path value is simply cn1).
+//   v6-3 (B2): CNU_lane's final (root) merge no longer computes a raw
+//       min1/min2 pair and normalizes it afterward -- the same
+//       comparison outputs (sel/c1/c2) select directly among the four
+//       semifinal candidates' *already-normalized* values (computed by
+//       nk64 in parallel with the comparison), which is bit-exact with
+//       merge-then-normalize but keeps normalize off the tail of the
+//       critical path.
+// See arch_notes.md section 3 (base architecture) and 4.2/4.3/4.4/4.6
+// (v3/v4/v5/v6 derivation) for the numeric derivation of every constant
 // below.
 
 module CNU_lane (
-    input      [4:0] mag0,
-    input      [4:0] mag1,
-    input      [4:0] mag2,
-    input      [4:0] mag3,
-    input      [4:0] mag4,
-    input      [4:0] mag5,
-    input      [4:0] mag6,
+    input      [5:0] key0,
+    input      [5:0] key1,
+    input      [5:0] key2,
+    input      [5:0] key3,
+    input      [5:0] key4,
+    input      [5:0] key5,
+    input      [5:0] key6,
     input      [6:0] qneg,
 
     output reg [19:0] c2v_new,
@@ -104,120 +85,165 @@ module CNU_lane (
     output reg [6:0]  rneg
 );
 
-    reg [12:0] leaf [0:6];
-    reg [12:0] pair01;
-    reg [12:0] pair23;
-    reg [12:0] pair45;
-    reg [12:0] group03;
-    reg [12:0] group46;
+    reg [14:0] leaf [0:6];
+    reg [14:0] pair01;
+    reg [14:0] pair23;
+    reg [14:0] pair45;
+    reg [14:0] group03;
+    reg [14:0] group46;
 
     reg [4:0] norm_min1;
     reg [4:0] norm_min2;
     reg [2:0] root_idx;
     reg       sign_parity;
 
-    function [12:0] merge_top2;
-        input [12:0] left_value;
-        input [12:0] right_value;
-        reg [4:0] next_min2;
+    // key = {one's-complement magnitude (5b, saturated), sign}. Ties
+    // always resolve to the lower edge index (see merge_top2 below), so a
+    // forced key of 63 (the maximum possible 6-bit value) can never win --
+    // that is what lets the capture path (LANE13_SLOT7) force-lose edge 6.
+    function [14:0] merge_top2;
+        input [14:0] left_value;
+        input [14:0] right_value;
+        reg [5:0] next_min2;
         begin
             // The tree always places lower edge indices in the left subtree.
             // Selecting left on a tie therefore implements the required tie rule.
-            if (left_value[12:8] <= right_value[12:8]) begin
-                if (left_value[4:0] < right_value[12:8])
-                    next_min2 = left_value[4:0];
+            if (left_value[14:9] <= right_value[14:9]) begin
+                if (left_value[5:0] < right_value[14:9])
+                    next_min2 = left_value[5:0];
                 else
-                    next_min2 = right_value[12:8];
-                merge_top2 = {left_value[12:5], next_min2};
+                    next_min2 = right_value[14:9];
+                merge_top2 = {left_value[14:6], next_min2};
             end else begin
-                if (right_value[4:0] < left_value[12:8])
-                    next_min2 = right_value[4:0];
+                if (right_value[5:0] < left_value[14:9])
+                    next_min2 = right_value[5:0];
                 else
-                    next_min2 = left_value[12:8];
-                merge_top2 = {right_value[12:5], next_min2};
+                    next_min2 = left_value[14:9];
+                merge_top2 = {right_value[14:6], next_min2};
             end
         end
     endfunction
 
-    // S1: (3m+2)>>2 as a 32-entry table instead of an adder.
-    function [4:0] norm5;
-        input [4:0] magnitude;
+    // v6-1: nk64 folds two steps into one 64-entry table on the 6-bit key:
+    // (1) the one's-complement -> two's-complement +1 correction that used
+    // to run once per edge (mp' = mp + sign, saturate at 31), and (2) S1's
+    // (3m+2)>>2 normalize. Equivalent to norm5(min((K>>1)+(K&1),31)).
+    // Applied only at the two root outputs (32 lookups total) instead of
+    // once per edge (112 incrementers removed).
+    function [4:0] nk64;
+        input [5:0] k;
         begin
-            case (magnitude)
-                5'd0:  norm5 = 5'd0;
-                5'd1:  norm5 = 5'd1;
-                5'd2:  norm5 = 5'd2;
-                5'd3:  norm5 = 5'd2;
-                5'd4:  norm5 = 5'd3;
-                5'd5:  norm5 = 5'd4;
-                5'd6:  norm5 = 5'd5;
-                5'd7:  norm5 = 5'd5;
-                5'd8:  norm5 = 5'd6;
-                5'd9:  norm5 = 5'd7;
-                5'd10: norm5 = 5'd8;
-                5'd11: norm5 = 5'd8;
-                5'd12: norm5 = 5'd9;
-                5'd13: norm5 = 5'd10;
-                5'd14: norm5 = 5'd11;
-                5'd15: norm5 = 5'd11;
-                5'd16: norm5 = 5'd12;
-                5'd17: norm5 = 5'd13;
-                5'd18: norm5 = 5'd14;
-                5'd19: norm5 = 5'd14;
-                5'd20: norm5 = 5'd15;
-                5'd21: norm5 = 5'd16;
-                5'd22: norm5 = 5'd17;
-                5'd23: norm5 = 5'd17;
-                5'd24: norm5 = 5'd18;
-                5'd25: norm5 = 5'd19;
-                5'd26: norm5 = 5'd20;
-                5'd27: norm5 = 5'd20;
-                5'd28: norm5 = 5'd21;
-                5'd29: norm5 = 5'd22;
-                5'd30: norm5 = 5'd23;
-                default: norm5 = 5'd23; // 31
+            case (k)
+                6'd0:  nk64 = 5'd0;
+                6'd1:  nk64 = 5'd1;
+                6'd2:  nk64 = 5'd1;
+                6'd3:  nk64 = 5'd2;
+                6'd4:  nk64 = 5'd2;
+                6'd5:  nk64 = 5'd2;
+                6'd6:  nk64 = 5'd2;
+                6'd7:  nk64 = 5'd3;
+                6'd8:  nk64 = 5'd3;
+                6'd9:  nk64 = 5'd4;
+                6'd10: nk64 = 5'd4;
+                6'd11: nk64 = 5'd5;
+                6'd12: nk64 = 5'd5;
+                6'd13: nk64 = 5'd5;
+                6'd14: nk64 = 5'd5;
+                6'd15: nk64 = 5'd6;
+                6'd16: nk64 = 5'd6;
+                6'd17: nk64 = 5'd7;
+                6'd18: nk64 = 5'd7;
+                6'd19: nk64 = 5'd8;
+                6'd20: nk64 = 5'd8;
+                6'd21: nk64 = 5'd8;
+                6'd22: nk64 = 5'd8;
+                6'd23: nk64 = 5'd9;
+                6'd24: nk64 = 5'd9;
+                6'd25: nk64 = 5'd10;
+                6'd26: nk64 = 5'd10;
+                6'd27: nk64 = 5'd11;
+                6'd28: nk64 = 5'd11;
+                6'd29: nk64 = 5'd11;
+                6'd30: nk64 = 5'd11;
+                6'd31: nk64 = 5'd12;
+                6'd32: nk64 = 5'd12;
+                6'd33: nk64 = 5'd13;
+                6'd34: nk64 = 5'd13;
+                6'd35: nk64 = 5'd14;
+                6'd36: nk64 = 5'd14;
+                6'd37: nk64 = 5'd14;
+                6'd38: nk64 = 5'd14;
+                6'd39: nk64 = 5'd15;
+                6'd40: nk64 = 5'd15;
+                6'd41: nk64 = 5'd16;
+                6'd42: nk64 = 5'd16;
+                6'd43: nk64 = 5'd17;
+                6'd44: nk64 = 5'd17;
+                6'd45: nk64 = 5'd17;
+                6'd46: nk64 = 5'd17;
+                6'd47: nk64 = 5'd18;
+                6'd48: nk64 = 5'd18;
+                6'd49: nk64 = 5'd19;
+                6'd50: nk64 = 5'd19;
+                6'd51: nk64 = 5'd20;
+                6'd52: nk64 = 5'd20;
+                6'd53: nk64 = 5'd20;
+                6'd54: nk64 = 5'd20;
+                6'd55: nk64 = 5'd21;
+                6'd56: nk64 = 5'd21;
+                6'd57: nk64 = 5'd22;
+                6'd58: nk64 = 5'd22;
+                6'd59: nk64 = 5'd23;
+                6'd60: nk64 = 5'd23;
+                default: nk64 = 5'd23; // k == 61, 62, 63
             endcase
         end
     endfunction
 
     always @(*) begin
-        leaf[0] = {mag0, 3'd0, 5'd31};
-        leaf[1] = {mag1, 3'd1, 5'd31};
-        leaf[2] = {mag2, 3'd2, 5'd31};
-        leaf[3] = {mag3, 3'd3, 5'd31};
-        leaf[4] = {mag4, 3'd4, 5'd31};
-        leaf[5] = {mag5, 3'd5, 5'd31};
-        leaf[6] = {mag6, 3'd6, 5'd31};
+        leaf[0] = {key0, 3'd0, 6'd63};
+        leaf[1] = {key1, 3'd1, 6'd63};
+        leaf[2] = {key2, 3'd2, 6'd63};
+        leaf[3] = {key3, 3'd3, 6'd63};
+        leaf[4] = {key4, 3'd4, 6'd63};
+        leaf[5] = {key5, 3'd5, 6'd63};
+        leaf[6] = {key6, 3'd6, 6'd63};
 
-        pair01   = merge_top2(leaf[0], leaf[1]);
-        pair23   = merge_top2(leaf[2], leaf[3]);
-        pair45   = merge_top2(leaf[4], leaf[5]);
-        group03  = merge_top2(pair01, pair23);
-        group46  = merge_top2(pair45, leaf[6]);
+        pair01  = merge_top2(leaf[0], leaf[1]);
+        pair23  = merge_top2(leaf[2], leaf[3]);
+        pair45  = merge_top2(leaf[4], leaf[5]);
+        group03 = merge_top2(pair01, pair23);
+        group46 = merge_top2(pair45, leaf[6]);
 
-        // B2 (5-bit): instead of merge_top2(group03, group46) followed by
-        // norm5 on its two raw-magnitude outputs, normalize the four
-        // semifinal candidates (a1/a2/b1/b2) in parallel with the root
-        // comparison and select directly among the normalized values.
-        // Bit-exact with the merge-then-normalize form (verified against
-        // it, 200k random cases); keeps normalize off the tail of the
-        // critical path.
-        // Written as if/else, matching merge_top2's own x-handling.
+        // v6-3 (B2): instead of merge_top2(group03, group46) followed by
+        // nk64 on its two raw-key outputs, normalize the four semifinal
+        // candidates (a1/a2/b1/b2) in parallel with the root comparison
+        // and select directly among the normalized values. Bit-exact with
+        // the merge-then-normalize form (verified against it); keeps
+        // normalize off the tail of the critical path.
         begin : ROOT
-            reg [4:0] a1, a2, b1, b2;
+            reg [5:0] a1, a2, b1, b2;
             reg [2:0] idx_a, idx_b;
-            a1 = group03[12:8]; idx_a = group03[7:5]; a2 = group03[4:0];
-            b1 = group46[12:8]; idx_b = group46[7:5]; b2 = group46[4:0];
+            a1 = group03[14:9]; idx_a = group03[8:6]; a2 = group03[5:0];
+            b1 = group46[14:9]; idx_b = group46[8:6]; b2 = group46[5:0];
+            // Written as if/else (matching merge_top2's own structure)
+            // rather than a ternary on a separately-computed comparison
+            // reg: an `if` on an x-valued condition deterministically
+            // takes the else branch (same as merge_top2), whereas
+            // `sel = (a<=b); sel ? .. : ..` would let x propagate through
+            // the ternary instead -- a simulation-only x-handling gap
+            // between the two forms, harmless on real (2-state) hardware
+            // but a hang risk in RTL sim while A/B still hold reset x's.
             if (a1 <= b1) begin
                 root_idx  = idx_a;
-                norm_min1 = norm5(a1);
-                if (a2 < b1) norm_min2 = norm5(a2);
-                else         norm_min2 = norm5(b1);
+                norm_min1 = nk64(a1);
+                if (a2 < b1) norm_min2 = nk64(a2);
+                else         norm_min2 = nk64(b1);
             end else begin
                 root_idx  = idx_b;
-                norm_min1 = norm5(b1);
-                if (b2 < a1) norm_min2 = norm5(b2);
-                else         norm_min2 = norm5(a1);
+                norm_min1 = nk64(b1);
+                if (b2 < a1) norm_min2 = nk64(b2);
+                else         norm_min2 = nk64(a1);
             end
         end
 
@@ -265,14 +291,7 @@ module LDPC (
 
     reg signed [7:0] A [0:7][0:15];
     reg signed [7:0] B [0:7][0:15];
-    // B3: stages 1-3 keep the 20-bit {min1,min2,idx[2:0],rneg[6:0]}
-    // format; stage 0 (the FIFO head, read every cycle for r_old) is
-    // widened to 24 bits {min1,min2,hit[6:0],rneg[6:0]} -- idx is decoded
-    // into a one-hot "hit" vector one stage early (at the stage1->stage0
-    // shift) so ro_mag's magnitude mux no longer waits on a live 3-bit
-    // idx compare.
-    reg        [19:0] c2v_fifo  [1:3][0:15];
-    reg        [23:0] c2v_fifo0 [0:15];
+    reg        [19:0] c2v_fifo [0:3][0:15];
 
     integer rr;
 
@@ -384,62 +403,29 @@ module LDPC (
     //============================================================
     // Per-layer edge table: edge e (0..6) is normally column e+1;
     // column 0 borrows edge (layer-1) at layer 1/2/3.
-    // Replicated into 4 groups (4 lanes each) so touch_first/qsel never
-    // fan out past the group of lanes they drive.
+    // Replicated into 4 groups (4 lanes each) so col_sel/touch_first
+    // never fan out past the group of lanes they drive.
     // S2: qsel (= !mode | touch_first) is registered the same way,
     // so the Q mux never reads `mode_reg` live either.
-    // v7.1 (R1): edges 3-6 never borrow column 0, so they read a fixed
-    // column (A[ge+1]/B[ge+1]) directly -- no select register at all.
-    // Edges 0-2 (which do borrow column 0, at layer e+1) use a 1-bit
-    // use_col0_gX[e] instead of the old 3-bit col_sel_gX[e] array index.
-    // v7's mistake: col_sel was a multi-bit *array index* whose real
-    // value set v5 only ever needed 2 (or 1, constant) entries of; DC
-    // exploited that (constant-folding edges 3-6, 2:1-muxing edges 0-2).
-    // Diverging col_sel's don't-care (S_OUT) value across the 4 groups
-    // (to stop them merging back into one big-fanout FF, same trick as
-    // qsel/touch_first below) defeated that exploitation instead --
-    // DC saw values col_sel never takes in v5 (0/1/6/7) and had to build
-    // a full multi-input read mux for every edge, +41.3k. use_col0 is
-    // genuinely 1-bit (value domain {0,1} even with the divergent S_OUT
-    // constants), so the same divergence trick is safe here.
     //============================================================
 
-    reg touch_first_g0 [0:6]; reg qsel_g0 [0:6]; reg use_col0_g0 [0:2];
-    reg touch_first_g1 [0:6]; reg qsel_g1 [0:6]; reg use_col0_g1 [0:2];
-    reg touch_first_g2 [0:6]; reg qsel_g2 [0:6]; reg use_col0_g2 [0:2];
-    reg touch_first_g3 [0:6]; reg qsel_g3 [0:6]; reg use_col0_g3 [0:2];
+    reg [2:0] col_sel_g0 [0:6]; reg touch_first_g0 [0:6]; reg qsel_g0 [0:6];
+    reg [2:0] col_sel_g1 [0:6]; reg touch_first_g1 [0:6]; reg qsel_g1 [0:6];
+    reg [2:0] col_sel_g2 [0:6]; reg touch_first_g2 [0:6]; reg qsel_g2 [0:6];
+    reg [2:0] col_sel_g3 [0:6]; reg touch_first_g3 [0:6]; reg qsel_g3 [0:6];
     integer ti;
 
-    // v7: during S_OUT the value of touch_first_g*/qsel_g*/use_col0_g* is
-    // a true don't-care (Xv/Qv/CNU results computed in this window are
-    // never latched into A/B/FIFO -- see the per-column write-back blocks
-    // below, none of which read these registers while !commit/!run_now).
-    // DC had folded the 4 identical replicated groups back into one FF
-    // (e.g. qsel_g2_reg, ~768 fanout) because their case(next_layer_comb)
-    // logic was structurally identical in every state. Diverging them
-    // here (constants for g0/g1, io_cnt[0]-derived for g2/g3, so each
-    // group's driving expression is structurally distinct) keeps the
-    // groups from being recognized as mergeable, without touching any
-    // value that matters (RUN, and LOAD's capture/overlap cycles, which
-    // are never in S_OUT).
     always @(posedge clk) begin
-        if (state == S_OUT) begin
-            for (ti = 0; ti < 7; ti = ti + 1) begin
-                touch_first_g0[ti] <= 1'b0;      qsel_g0[ti] <= 1'b0;
-                touch_first_g1[ti] <= 1'b1;      qsel_g1[ti] <= 1'b1;
-                touch_first_g2[ti] <= io_cnt[0]; qsel_g2[ti] <= io_cnt[0];
-                touch_first_g3[ti] <= ~io_cnt[0]; qsel_g3[ti] <= ~io_cnt[0];
-            end
-            for (ti = 0; ti < 3; ti = ti + 1) begin
-                use_col0_g0[ti] <= 1'b0;      use_col0_g1[ti] <= 1'b1;
-                use_col0_g2[ti] <= io_cnt[0]; use_col0_g3[ti] <= ~io_cnt[0];
-            end
-        end else case (next_layer_comb)
+        case (next_layer_comb)
             2'd0: begin
-                use_col0_g0[0] <= 1'b0; use_col0_g0[1] <= 1'b0; use_col0_g0[2] <= 1'b0;
-                use_col0_g1[0] <= 1'b0; use_col0_g1[1] <= 1'b0; use_col0_g1[2] <= 1'b0;
-                use_col0_g2[0] <= 1'b0; use_col0_g2[1] <= 1'b0; use_col0_g2[2] <= 1'b0;
-                use_col0_g3[0] <= 1'b0; use_col0_g3[1] <= 1'b0; use_col0_g3[2] <= 1'b0;
+                col_sel_g0[0] <= 3'd1; col_sel_g0[1] <= 3'd2; col_sel_g0[2] <= 3'd3;
+                col_sel_g0[3] <= 3'd4; col_sel_g0[4] <= 3'd5; col_sel_g0[5] <= 3'd6; col_sel_g0[6] <= 3'd7;
+                col_sel_g1[0] <= 3'd1; col_sel_g1[1] <= 3'd2; col_sel_g1[2] <= 3'd3;
+                col_sel_g1[3] <= 3'd4; col_sel_g1[4] <= 3'd5; col_sel_g1[5] <= 3'd6; col_sel_g1[6] <= 3'd7;
+                col_sel_g2[0] <= 3'd1; col_sel_g2[1] <= 3'd2; col_sel_g2[2] <= 3'd3;
+                col_sel_g2[3] <= 3'd4; col_sel_g2[4] <= 3'd5; col_sel_g2[5] <= 3'd6; col_sel_g2[6] <= 3'd7;
+                col_sel_g3[0] <= 3'd1; col_sel_g3[1] <= 3'd2; col_sel_g3[2] <= 3'd3;
+                col_sel_g3[3] <= 3'd4; col_sel_g3[4] <= 3'd5; col_sel_g3[5] <= 3'd6; col_sel_g3[6] <= 3'd7;
                 for (ti = 0; ti < 7; ti = ti + 1) begin
                     touch_first_g0[ti] <= 1'b1; touch_first_g1[ti] <= 1'b1;
                     touch_first_g2[ti] <= 1'b1; touch_first_g3[ti] <= 1'b1;
@@ -448,10 +434,14 @@ module LDPC (
                 end
             end
             2'd1: begin
-                use_col0_g0[0] <= 1'b1; use_col0_g0[1] <= 1'b0; use_col0_g0[2] <= 1'b0;
-                use_col0_g1[0] <= 1'b1; use_col0_g1[1] <= 1'b0; use_col0_g1[2] <= 1'b0;
-                use_col0_g2[0] <= 1'b1; use_col0_g2[1] <= 1'b0; use_col0_g2[2] <= 1'b0;
-                use_col0_g3[0] <= 1'b1; use_col0_g3[1] <= 1'b0; use_col0_g3[2] <= 1'b0;
+                col_sel_g0[0] <= 3'd0; col_sel_g0[1] <= 3'd2; col_sel_g0[2] <= 3'd3;
+                col_sel_g0[3] <= 3'd4; col_sel_g0[4] <= 3'd5; col_sel_g0[5] <= 3'd6; col_sel_g0[6] <= 3'd7;
+                col_sel_g1[0] <= 3'd0; col_sel_g1[1] <= 3'd2; col_sel_g1[2] <= 3'd3;
+                col_sel_g1[3] <= 3'd4; col_sel_g1[4] <= 3'd5; col_sel_g1[5] <= 3'd6; col_sel_g1[6] <= 3'd7;
+                col_sel_g2[0] <= 3'd0; col_sel_g2[1] <= 3'd2; col_sel_g2[2] <= 3'd3;
+                col_sel_g2[3] <= 3'd4; col_sel_g2[4] <= 3'd5; col_sel_g2[5] <= 3'd6; col_sel_g2[6] <= 3'd7;
+                col_sel_g3[0] <= 3'd0; col_sel_g3[1] <= 3'd2; col_sel_g3[2] <= 3'd3;
+                col_sel_g3[3] <= 3'd4; col_sel_g3[4] <= 3'd5; col_sel_g3[5] <= 3'd6; col_sel_g3[6] <= 3'd7;
                 touch_first_g0[0] <= 1'b1; touch_first_g1[0] <= 1'b1;
                 touch_first_g2[0] <= 1'b1; touch_first_g3[0] <= 1'b1;
                 qsel_g0[0] <= 1'b1; qsel_g1[0] <= 1'b1; qsel_g2[0] <= 1'b1; qsel_g3[0] <= 1'b1;
@@ -463,10 +453,14 @@ module LDPC (
                 end
             end
             2'd2: begin
-                use_col0_g0[0] <= 1'b0; use_col0_g0[1] <= 1'b1; use_col0_g0[2] <= 1'b0;
-                use_col0_g1[0] <= 1'b0; use_col0_g1[1] <= 1'b1; use_col0_g1[2] <= 1'b0;
-                use_col0_g2[0] <= 1'b0; use_col0_g2[1] <= 1'b1; use_col0_g2[2] <= 1'b0;
-                use_col0_g3[0] <= 1'b0; use_col0_g3[1] <= 1'b1; use_col0_g3[2] <= 1'b0;
+                col_sel_g0[0] <= 3'd1; col_sel_g0[1] <= 3'd0; col_sel_g0[2] <= 3'd3;
+                col_sel_g0[3] <= 3'd4; col_sel_g0[4] <= 3'd5; col_sel_g0[5] <= 3'd6; col_sel_g0[6] <= 3'd7;
+                col_sel_g1[0] <= 3'd1; col_sel_g1[1] <= 3'd0; col_sel_g1[2] <= 3'd3;
+                col_sel_g1[3] <= 3'd4; col_sel_g1[4] <= 3'd5; col_sel_g1[5] <= 3'd6; col_sel_g1[6] <= 3'd7;
+                col_sel_g2[0] <= 3'd1; col_sel_g2[1] <= 3'd0; col_sel_g2[2] <= 3'd3;
+                col_sel_g2[3] <= 3'd4; col_sel_g2[4] <= 3'd5; col_sel_g2[5] <= 3'd6; col_sel_g2[6] <= 3'd7;
+                col_sel_g3[0] <= 3'd1; col_sel_g3[1] <= 3'd0; col_sel_g3[2] <= 3'd3;
+                col_sel_g3[3] <= 3'd4; col_sel_g3[4] <= 3'd5; col_sel_g3[5] <= 3'd6; col_sel_g3[6] <= 3'd7;
                 for (ti = 0; ti < 7; ti = ti + 1) begin
                     touch_first_g0[ti] <= 1'b0; touch_first_g1[ti] <= 1'b0;
                     touch_first_g2[ti] <= 1'b0; touch_first_g3[ti] <= 1'b0;
@@ -475,10 +469,14 @@ module LDPC (
                 end
             end
             default: begin // layer 3
-                use_col0_g0[0] <= 1'b0; use_col0_g0[1] <= 1'b0; use_col0_g0[2] <= 1'b1;
-                use_col0_g1[0] <= 1'b0; use_col0_g1[1] <= 1'b0; use_col0_g1[2] <= 1'b1;
-                use_col0_g2[0] <= 1'b0; use_col0_g2[1] <= 1'b0; use_col0_g2[2] <= 1'b1;
-                use_col0_g3[0] <= 1'b0; use_col0_g3[1] <= 1'b0; use_col0_g3[2] <= 1'b1;
+                col_sel_g0[0] <= 3'd1; col_sel_g0[1] <= 3'd2; col_sel_g0[2] <= 3'd0;
+                col_sel_g0[3] <= 3'd4; col_sel_g0[4] <= 3'd5; col_sel_g0[5] <= 3'd6; col_sel_g0[6] <= 3'd7;
+                col_sel_g1[0] <= 3'd1; col_sel_g1[1] <= 3'd2; col_sel_g1[2] <= 3'd0;
+                col_sel_g1[3] <= 3'd4; col_sel_g1[4] <= 3'd5; col_sel_g1[5] <= 3'd6; col_sel_g1[6] <= 3'd7;
+                col_sel_g2[0] <= 3'd1; col_sel_g2[1] <= 3'd2; col_sel_g2[2] <= 3'd0;
+                col_sel_g2[3] <= 3'd4; col_sel_g2[4] <= 3'd5; col_sel_g2[5] <= 3'd6; col_sel_g2[6] <= 3'd7;
+                col_sel_g3[0] <= 3'd1; col_sel_g3[1] <= 3'd2; col_sel_g3[2] <= 3'd0;
+                col_sel_g3[3] <= 3'd4; col_sel_g3[4] <= 3'd5; col_sel_g3[5] <= 3'd6; col_sel_g3[6] <= 3'd7;
                 for (ti = 0; ti < 7; ti = ti + 1) begin
                     touch_first_g0[ti] <= 1'b0; touch_first_g1[ti] <= 1'b0;
                     touch_first_g2[ti] <= 1'b0; touch_first_g3[ti] <= 1'b0;
@@ -505,97 +503,71 @@ module LDPC (
     wire               ro_neg [0:6][0:15];
     wire signed [7:0] q_base [0:6][0:15];
     wire signed [7:0] x_base [0:6][0:15];
-    wire        [4:0] q_mag  [0:6][0:15];
+    // v6-1: q_key replaces q_mag -- one's-complement magnitude (no +1
+    // correction) packed with the sign into a 6-bit key for CNU_lane's
+    // tree. q_sgn is kept as a separate signal (same value as q_key's LSB
+    // in the normal case) because the capture force below must decouple
+    // them: key forces to 63 (always-loses) while q_sgn forces to 0.
+    wire        [5:0] q_key  [0:6][0:15];
     wire               q_sgn  [0:6][0:15];
 
     genvar ge, gl;
     generate
         // Xv/Qv: 4 lane-groups, each fed from its own replicated
-        // touch_first_gX / qsel_gX / use_col0_gX registers.
-        // v7.1 (R1): edge 0 keeps S7 (B side hardwired to B[1] -- column
-        // 0's B is never selected there, its only slot-1 touch is
-        // 'first', always reading A). Edges 1-2 mux column 0 in via
-        // use_col0 on both A and B sides. Edges 3-6 never borrow column
-        // 0, so they are fixed wiring to A[ge+1]/B[ge+1] -- no select
-        // register at all.
+        // col_sel_gX / touch_first_gX / qsel_gX registers. S7: edge 0's
+        // B side is hardwired to B[1] -- column 0's B is never selected
+        // there (its only slot-1 touch is 'first', always reading A).
         for (ge = 0; ge < 7; ge = ge + 1) begin: XQ0
             for (gl = 0; gl < 4; gl = gl + 1) begin: LANE
                 if (ge == 0) begin: EDGE0_S7
-                    wire signed [7:0] a_sel = use_col0_g0[0] ? A[0][gl] : A[1][gl];
-                    assign Xv[ge][gl] = touch_first_g0[ge] ? a_sel : B[1][gl];
-                    assign Qv[ge][gl] = qsel_g0[ge]        ? a_sel : B[1][gl];
-                end else if (ge == 1 || ge == 2) begin: EDGE12_COL0
-                    wire signed [7:0] a_sel = use_col0_g0[ge] ? A[0][gl] : A[ge+1][gl];
-                    wire signed [7:0] b_sel = use_col0_g0[ge] ? B[0][gl] : B[ge+1][gl];
-                    assign Xv[ge][gl] = touch_first_g0[ge] ? a_sel : b_sel;
-                    assign Qv[ge][gl] = qsel_g0[ge]        ? a_sel : b_sel;
-                end else begin: EDGE_FIXED
-                    assign Xv[ge][gl] = touch_first_g0[ge] ? A[ge+1][gl] : B[ge+1][gl];
-                    assign Qv[ge][gl] = qsel_g0[ge]        ? A[ge+1][gl] : B[ge+1][gl];
+                    assign Xv[ge][gl] = touch_first_g0[ge] ? A[col_sel_g0[ge]][gl] : B[1][gl];
+                    assign Qv[ge][gl] = qsel_g0[ge]        ? A[col_sel_g0[ge]][gl] : B[1][gl];
+                end else begin: EDGE_NORMAL
+                    assign Xv[ge][gl] = touch_first_g0[ge] ? A[col_sel_g0[ge]][gl] : B[col_sel_g0[ge]][gl];
+                    assign Qv[ge][gl] = qsel_g0[ge]        ? A[col_sel_g0[ge]][gl] : B[col_sel_g0[ge]][gl];
                 end
             end
         end
         for (ge = 0; ge < 7; ge = ge + 1) begin: XQ1
             for (gl = 4; gl < 8; gl = gl + 1) begin: LANE
                 if (ge == 0) begin: EDGE0_S7
-                    wire signed [7:0] a_sel = use_col0_g1[0] ? A[0][gl] : A[1][gl];
-                    assign Xv[ge][gl] = touch_first_g1[ge] ? a_sel : B[1][gl];
-                    assign Qv[ge][gl] = qsel_g1[ge]        ? a_sel : B[1][gl];
-                end else if (ge == 1 || ge == 2) begin: EDGE12_COL0
-                    wire signed [7:0] a_sel = use_col0_g1[ge] ? A[0][gl] : A[ge+1][gl];
-                    wire signed [7:0] b_sel = use_col0_g1[ge] ? B[0][gl] : B[ge+1][gl];
-                    assign Xv[ge][gl] = touch_first_g1[ge] ? a_sel : b_sel;
-                    assign Qv[ge][gl] = qsel_g1[ge]        ? a_sel : b_sel;
-                end else begin: EDGE_FIXED
-                    assign Xv[ge][gl] = touch_first_g1[ge] ? A[ge+1][gl] : B[ge+1][gl];
-                    assign Qv[ge][gl] = qsel_g1[ge]        ? A[ge+1][gl] : B[ge+1][gl];
+                    assign Xv[ge][gl] = touch_first_g1[ge] ? A[col_sel_g1[ge]][gl] : B[1][gl];
+                    assign Qv[ge][gl] = qsel_g1[ge]        ? A[col_sel_g1[ge]][gl] : B[1][gl];
+                end else begin: EDGE_NORMAL
+                    assign Xv[ge][gl] = touch_first_g1[ge] ? A[col_sel_g1[ge]][gl] : B[col_sel_g1[ge]][gl];
+                    assign Qv[ge][gl] = qsel_g1[ge]        ? A[col_sel_g1[ge]][gl] : B[col_sel_g1[ge]][gl];
                 end
             end
         end
         for (ge = 0; ge < 7; ge = ge + 1) begin: XQ2
             for (gl = 8; gl < 12; gl = gl + 1) begin: LANE
                 if (ge == 0) begin: EDGE0_S7
-                    wire signed [7:0] a_sel = use_col0_g2[0] ? A[0][gl] : A[1][gl];
-                    assign Xv[ge][gl] = touch_first_g2[ge] ? a_sel : B[1][gl];
-                    assign Qv[ge][gl] = qsel_g2[ge]        ? a_sel : B[1][gl];
-                end else if (ge == 1 || ge == 2) begin: EDGE12_COL0
-                    wire signed [7:0] a_sel = use_col0_g2[ge] ? A[0][gl] : A[ge+1][gl];
-                    wire signed [7:0] b_sel = use_col0_g2[ge] ? B[0][gl] : B[ge+1][gl];
-                    assign Xv[ge][gl] = touch_first_g2[ge] ? a_sel : b_sel;
-                    assign Qv[ge][gl] = qsel_g2[ge]        ? a_sel : b_sel;
-                end else begin: EDGE_FIXED
-                    assign Xv[ge][gl] = touch_first_g2[ge] ? A[ge+1][gl] : B[ge+1][gl];
-                    assign Qv[ge][gl] = qsel_g2[ge]        ? A[ge+1][gl] : B[ge+1][gl];
+                    assign Xv[ge][gl] = touch_first_g2[ge] ? A[col_sel_g2[ge]][gl] : B[1][gl];
+                    assign Qv[ge][gl] = qsel_g2[ge]        ? A[col_sel_g2[ge]][gl] : B[1][gl];
+                end else begin: EDGE_NORMAL
+                    assign Xv[ge][gl] = touch_first_g2[ge] ? A[col_sel_g2[ge]][gl] : B[col_sel_g2[ge]][gl];
+                    assign Qv[ge][gl] = qsel_g2[ge]        ? A[col_sel_g2[ge]][gl] : B[col_sel_g2[ge]][gl];
                 end
             end
         end
         for (ge = 0; ge < 7; ge = ge + 1) begin: XQ3
             for (gl = 12; gl < 16; gl = gl + 1) begin: LANE
                 if (ge == 0) begin: EDGE0_S7
-                    wire signed [7:0] a_sel = use_col0_g3[0] ? A[0][gl] : A[1][gl];
-                    assign Xv[ge][gl] = touch_first_g3[ge] ? a_sel : B[1][gl];
-                    assign Qv[ge][gl] = qsel_g3[ge]        ? a_sel : B[1][gl];
-                end else if (ge == 1 || ge == 2) begin: EDGE12_COL0
-                    wire signed [7:0] a_sel = use_col0_g3[ge] ? A[0][gl] : A[ge+1][gl];
-                    wire signed [7:0] b_sel = use_col0_g3[ge] ? B[0][gl] : B[ge+1][gl];
-                    assign Xv[ge][gl] = touch_first_g3[ge] ? a_sel : b_sel;
-                    assign Qv[ge][gl] = qsel_g3[ge]        ? a_sel : b_sel;
-                end else begin: EDGE_FIXED
-                    assign Xv[ge][gl] = touch_first_g3[ge] ? A[ge+1][gl] : B[ge+1][gl];
-                    assign Qv[ge][gl] = qsel_g3[ge]        ? A[ge+1][gl] : B[ge+1][gl];
+                    assign Xv[ge][gl] = touch_first_g3[ge] ? A[col_sel_g3[ge]][gl] : B[1][gl];
+                    assign Qv[ge][gl] = qsel_g3[ge]        ? A[col_sel_g3[ge]][gl] : B[1][gl];
+                end else begin: EDGE_NORMAL
+                    assign Xv[ge][gl] = touch_first_g3[ge] ? A[col_sel_g3[ge]][gl] : B[col_sel_g3[ge]][gl];
+                    assign Qv[ge][gl] = qsel_g3[ge]        ? A[col_sel_g3[ge]][gl] : B[col_sel_g3[ge]][gl];
                 end
             end
         end
 
         for (ge = 0; ge < 7; ge = ge + 1) begin: EDGE
             for (gl = 0; gl < 16; gl = gl + 1) begin: LANE
-                // B3: hit[e] was already decoded from idx one stage
-                // earlier (see the FIFO shift below), so r_old's
-                // magnitude select is a plain one-hot mux, not a compare.
-                assign ro_mag[ge][gl] = c2v_fifo0[gl][7 + ge]
-                                        ? c2v_fifo0[gl][18:14]
-                                        : c2v_fifo0[gl][23:19];
-                assign ro_neg[ge][gl] = c2v_fifo0[gl][ge];
+                assign ro_mag[ge][gl] = (c2v_fifo[0][gl][9:7] == ge[2:0])
+                                        ? c2v_fifo[0][gl][14:10]
+                                        : c2v_fifo[0][gl][19:15];
+                assign ro_neg[ge][gl] = c2v_fifo[0][gl][ge];
 
                 // q_base = Q - r_old, via conditional-invert add.
                 wire       op_s_w = ~ro_neg[ge][gl];
@@ -612,9 +584,9 @@ module LDPC (
 
                     wire        sgn_w = q_base[ge][gl][7];
                     wire [6:0]  lo_w  = sgn_w ? ~q_base[ge][gl][6:0] : q_base[ge][gl][6:0];
-                    wire [5:0]  am_w  = {1'b0, lo_w[4:0]} + {5'b0, sgn_w};
-                    wire        sat_w = (lo_w[6:5] != 2'b00) | am_w[5];
-                    assign q_mag[ge][gl] = sat_w ? 5'd31 : am_w[4:0];
+                    wire        sat_w = (lo_w[6:5] != 2'b00);
+                    wire [4:0]  mp_w  = sat_w ? 5'd31 : lo_w[4:0];
+                    assign q_key[ge][gl] = {mp_w, sgn_w};
                     assign q_sgn[ge][gl] = sgn_w;
                 end else if (ge == 6 && gl == 13) begin: LANE13_SLOT7
                     // Capture cycle input: forced to (mag 31, sign +) for
@@ -630,18 +602,21 @@ module LDPC (
 
                     wire        sgn_w = q_base[ge][gl][7];
                     wire [6:0]  lo_w  = sgn_w ? ~q_base[ge][gl][6:0] : q_base[ge][gl][6:0];
-                    wire [5:0]  am_w  = {1'b0, lo_w[4:0]} + {5'b0, sgn_w};
-                    wire        sat_w = (lo_w[6:5] != 2'b00) | am_w[5];
-                    assign q_mag[ge][gl] = ((state == S_LOAD) && !overlap_cycle) ? 5'd31 : (sat_w ? 5'd31 : am_w[4:0]);
+                    wire        sat_w = (lo_w[6:5] != 2'b00);
+                    wire [4:0]  mp_w  = sat_w ? 5'd31 : lo_w[4:0];
+                    // Forced to key 63 (the max possible value -- always
+                    // loses ties, see merge_top2's comment) while this
+                    // window's q_sgn is forced separately to 0.
+                    assign q_key[ge][gl] = ((state == S_LOAD) && !overlap_cycle) ? 6'd63 : {mp_w, sgn_w};
                     assign q_sgn[ge][gl] = ((state == S_LOAD) && !overlap_cycle) ? 1'b0  : sgn_w;
                 end else begin: LANE_NORMAL
                     assign x_base[ge][gl] = Xv[ge][gl] + op_w + {7'b0, op_s_w};
 
                     wire        sgn_w = q_base[ge][gl][7];
                     wire [6:0]  lo_w  = sgn_w ? ~q_base[ge][gl][6:0] : q_base[ge][gl][6:0];
-                    wire [5:0]  am_w  = {1'b0, lo_w[4:0]} + {5'b0, sgn_w};
-                    wire        sat_w = (lo_w[6:5] != 2'b00) | am_w[5];
-                    assign q_mag[ge][gl] = sat_w ? 5'd31 : am_w[4:0];
+                    wire        sat_w = (lo_w[6:5] != 2'b00);
+                    wire [4:0]  mp_w  = sat_w ? 5'd31 : lo_w[4:0];
+                    assign q_key[ge][gl] = {mp_w, sgn_w};
                     assign q_sgn[ge][gl] = sgn_w;
                 end
             end
@@ -665,10 +640,10 @@ module LDPC (
     generate
         for (glane = 0; glane < 16; glane = glane + 1) begin: CNU_INST
             CNU_lane u_cnu (
-                .mag0(q_mag[0][glane]), .mag1(q_mag[1][glane]),
-                .mag2(q_mag[2][glane]), .mag3(q_mag[3][glane]),
-                .mag4(q_mag[4][glane]), .mag5(q_mag[5][glane]),
-                .mag6(q_mag[6][glane]),
+                .key0(q_key[0][glane]), .key1(q_key[1][glane]),
+                .key2(q_key[2][glane]), .key3(q_key[3][glane]),
+                .key4(q_key[4][glane]), .key5(q_key[5][glane]),
+                .key6(q_key[6][glane]),
                 .qneg(qneg_vec[glane]),
                 .c2v_new(c2v_new_lane[glane]),
                 .rmag_flat(rmag_flat_lane[glane]),
@@ -740,11 +715,11 @@ module LDPC (
     wire [2:0] cidx  = cap_desc[9:7];
     wire [6:0] crneg = cap_desc[6:0];
 
-    // B1: thr24(c) = min{m : norm5(m) >= c}. Since norm5 is monotonic
+    // v6-2 (B1): thr24(c) = min{m : norm(m) >= c}. Since norm is monotonic
     // non-decreasing, "nx < c" is equivalent to "|in_data| < thr24(c)".
-    // thr1/thr2 depend only on cap_desc (an FF, stable well before
-    // in_data arrives), so in_data is compared directly against +-thr
-    // instead of waiting for its own abs+norm (nx) to resolve first.
+    // thr1/thr2 depend only on cap_desc (an FF, stable well before in_data
+    // arrives), so in_data is compared directly against +-thr instead of
+    // waiting for its own abs+norm (nx) to resolve first.
     function [4:0] thr24;
         input [4:0] c;
         begin
@@ -777,26 +752,26 @@ module LDPC (
         end
     endfunction
 
-    wire [4:0]        thr1      = thr24(cn1);
-    wire [4:0]        thr2      = thr24(cn2);
+    wire [4:0]        thr1     = thr24(cn1);
+    wire [4:0]        thr2     = thr24(cn2);
     wire signed [6:0] in_data_s = {in_data[5], in_data};
     wire signed [6:0] neg_thr1  = -{2'b00, thr1};
     wire signed [6:0] neg_thr2  = -{2'b00, thr2};
-    wire nx_lt_cn1 = in_data[5] ? (in_data_s > neg_thr1) : (in_data[4:0] < thr1);
-    wire nx_lt_cn2 = in_data[5] ? (in_data_s > neg_thr2) : (in_data[4:0] < thr2);
+    wire lt1 = in_data[5] ? (in_data_s > neg_thr1) : (in_data[4:0] < thr1);
+    wire lt2 = in_data[5] ? (in_data_s > neg_thr2) : (in_data[4:0] < thr2);
 
     // v5 (A): the two comparisons against in_data's magnitude are shared.
     // min(select(cn1, cn2), nx) == select(min(cn1, nx), min(cn2, nx)), so
     // each edge only picks between p1/p2 instead of owning a comparator.
-    wire [4:0] p1 = nx_lt_cn1 ? nx : cn1;
-    wire [4:0] p2 = nx_lt_cn2 ? nx : cn2;
+    wire [4:0] p1 = lt1 ? nx : cn1;
+    wire [4:0] p2 = lt2 ? nx : cn2;
 
     // Per-edge fast-path r_new for lane 12 (used by newv below): edge 6's
-    // own value never depends on itself. cidx != 6 (its capture-forced
-    // magnitude, 31, can never win CNU_lane's tie -- ties favor the lower
-    // edge index, and edge 6 is the highest), so edge 6's fast-path value
-    // is simply cn1/crneg[6] unchanged, no mux needed. The other 6 edges
-    // must now also consider the fresh in_data.
+    // own value never depends on itself. v6-2's cidx!=6 simplification:
+    // its capture-forced key (63, the maximum possible value) can never
+    // win a tie (see CNU_lane's merge_top2 comment), so cidx is never 6 --
+    // rmag_fast[6] is simply cn1 (crneg[6] unchanged), no mux needed. The
+    // other 6 edges must now also consider the fresh in_data.
     wire [4:0] rmag_fast [0:6];
     wire       rneg_fast [0:6];
     genvar fe;
@@ -815,8 +790,8 @@ module LDPC (
     // New FIFO descriptor for lane 12: the true top-2/idx among all 7
     // edges now that in_data (edge 6) is a real candidate.
     wire [4:0] fast_m1   = p1;
-    wire [4:0] fast_m2   = nx_lt_cn1 ? cn1 : p2;
-    wire [2:0] fast_idx  = nx_lt_cn1 ? 3'd6 : cidx;
+    wire [4:0] fast_m2   = lt1 ? cn1 : p2;
+    wire [2:0] fast_idx  = lt1 ? 3'd6 : cidx;
     wire [6:0] fast_rneg = {rneg_fast[6], rneg_fast[5], rneg_fast[4], rneg_fast[3],
                             rneg_fast[2], rneg_fast[1], rneg_fast[0]};
     wire [19:0] fast_desc = {fast_m1, fast_m2, fast_idx, fast_rneg};
@@ -853,28 +828,9 @@ module LDPC (
     // hazard, but it is real for RTL/gate-level sim).
     //============================================================
 
-    // B3: idx -> one-hot, decoded once at the stage1->stage0 shift instead
-    // of once per r_old read. idx == 0 (the all-zero-desc case that fills
-    // the FIFO while idle) decodes to a fully deterministic hit[0] = 1,
-    // so no x can leak through here even before the first real write.
-    function [6:0] hit_of;
-        input [2:0] idx;
-        begin
-            case (idx)
-                3'd0: hit_of = 7'b0000001;
-                3'd1: hit_of = 7'b0000010;
-                3'd2: hit_of = 7'b0000100;
-                3'd3: hit_of = 7'b0001000;
-                3'd4: hit_of = 7'b0010000;
-                3'd5: hit_of = 7'b0100000;
-                default: hit_of = 7'b1000000; // idx == 6
-            endcase
-        end
-    endfunction
-
     always @(posedge clk) begin
         for (rr = 0; rr < 16; rr = rr + 1) begin
-            c2v_fifo0[rr] <= {c2v_fifo[1][rr][19:10], hit_of(c2v_fifo[1][rr][9:7]), c2v_fifo[1][rr][6:0]};
+            c2v_fifo[0][rr] <= c2v_fifo[1][rr];
             c2v_fifo[1][rr] <= c2v_fifo[2][rr];
             c2v_fifo[2][rr] <= c2v_fifo[3][rr];
             if (run_now) begin
